@@ -108,52 +108,7 @@ jobs:
       - name: Configure Android permissions & build numbers
         shell: bash
         run: |
-          MANIFEST="android/app/src/main/AndroidManifest.xml"
-          node -e '
-            const fs = require("fs");
-            const path = process.argv[1];
-            let xml = fs.readFileSync(path, "utf8");
-            const perms = [
-              "android.permission.CAMERA",
-              "android.permission.RECORD_AUDIO",
-              "android.permission.MODIFY_AUDIO_SETTINGS"
-            ];
-            for (const p of perms) {
-              if (!xml.includes(p)) {
-                xml = xml.replace("</manifest>", `    <uses-permission android:name="${p}" />\n</manifest>`);
-              }
-            }
-            fs.writeFileSync(path, xml);
-          ' "$MANIFEST"
-
-          GRADLE="android/app/build.gradle"
-          node -e '
-            const fs = require("fs");
-            const path = process.argv[1];
-            const buildNum = process.argv[2];
-            const verName = process.argv[3];
-            let gradle = fs.readFileSync(path, "utf8");
-            gradle = gradle.replace(/versionCode\s+\d+/, `versionCode ${buildNum}`);
-            gradle = gradle.replace(/versionName\s+"[^"]+"/, `versionName "${verName}"`);
-            if (!gradle.includes("signingConfigs")) {
-              const signingBlock = `
-    signingConfigs {
-        release {
-            storeFile file("release.keystore")
-            storePassword System.getenv("KEYSTORE_PASS") ?: "masterok_beta_keystore"
-            keyAlias System.getenv("KEY_ALIAS") ?: "masterok"
-            keyPassword System.getenv("KEY_PASS") ?: "masterok_beta_keystore"
-        }
-    }
-`;
-              gradle = gradle.replace("buildTypes {", signingBlock + "\n    buildTypes {");
-              gradle = gradle.replace(
-                /buildTypes\s*\{\s*release\s*\{/,
-                "buildTypes {\n        release {\n            signingConfig signingConfigs.release"
-              );
-            }
-            fs.writeFileSync(path, gradle);
-          ' "$GRADLE" "${{ steps.meta.outputs.build_number }}" "${{ steps.meta.outputs.version_name }}"
+          node scripts/prepare-android.mjs "${{ steps.meta.outputs.build_number }}" "${{ steps.meta.outputs.version_name }}"
 
       - name: Prepare Android signing keystore
         shell: bash
