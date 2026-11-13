@@ -1,0 +1,8 @@
+{
+  "appId": "ru.masterok.homegenie",
+  "appName": "МастерОК",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https"
+  }
+}

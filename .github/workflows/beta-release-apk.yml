@@ -1,0 +1,241 @@
+name: Beta Release APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_prefix:
+        description: 'Базовая версия (например, 1.0.0)'
+        required: true
+        default: '1.0.0'
+        type: string
+      build_number:
+        description: 'Номер сборки (оставьте пустым для автоинкремента)'
+        required: false
+        default: ''
+        type: string
+      release_notes:
+        description: 'Комментарий к бета-релизу'
+        required: false
+        default: 'Автоматическая бета-сборка Android APK для МастерОК (HomeGenie).'
+        type: string
+  push:
+    branches:
+      - beta
+    tags:
+      - 'v*-beta*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-beta-apk:
+    name: Build & Publish Beta APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Compute auto-incrementing build number & version
+        id: meta
+        shell: bash
+        run: |
+          VERSION_PREFIX="${{ inputs.version_prefix || '1.0.0' }}"
+          INPUT_BUILD="${{ inputs.build_number }}"
+
+          # Определяем максимальный существующий номер бета-сборки по git-тегам
+          MAX_TAG_BUILD=$(git tag -l "v*-beta.*" | sed -E 's/.*-beta\.([0-9]+).*/\1/' | grep -E '^[0-9]+$' | sort -n | tail -1 || true)
+          if [ -z "$MAX_TAG_BUILD" ]; then
+            MAX_TAG_BUILD=0
+          fi
+
+          RUN_NUM="${{ github.run_number }}"
+          NEXT_AUTO=$((MAX_TAG_BUILD + 1))
+          if [ "$RUN_NUM" -gt "$NEXT_AUTO" ]; then
+            AUTO_BUILD="$RUN_NUM"
+          else
+            AUTO_BUILD="$NEXT_AUTO"
+          fi
+
+          if [ -n "$INPUT_BUILD" ]; then
+            BUILD_NUMBER="$INPUT_BUILD"
+          else
+            BUILD_NUMBER="$AUTO_BUILD"
+          fi
+
+          VERSION_NAME="${VERSION_PREFIX}-beta.${BUILD_NUMBER}"
+          TAG_NAME="v${VERSION_NAME}"
+          APK_FILENAME="MasterOK-v${VERSION_NAME}.apk"
+
+          echo "build_number=${BUILD_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "version_name=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "apk_filename=${APK_FILENAME}" >> "$GITHUB_OUTPUT"
+
+          echo "Building ${APK_FILENAME} (versionCode=${BUILD_NUMBER}, versionName=${VERSION_NAME})"
+
+      - name: Install dependencies & verify web build
+        run: |
+          npm install
+          npm run lint
+          npx tsx --test src/utils/engine.test.ts
+          npm run build
+
+      - name: Initialize Capacitor Android project
+        run: |
+          npm install --no-save @capacitor/core@^7.0.0 @capacitor/cli@^7.0.0 @capacitor/android@^7.0.0
+          if [ ! -d "android" ]; then
+            npx cap add android
+          fi
+          npx cap sync android
+
+      - name: Configure Android permissions & build numbers
+        shell: bash
+        run: |
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          node -e '
+            const fs = require("fs");
+            const path = process.argv[1];
+            let xml = fs.readFileSync(path, "utf8");
+            const perms = [
+              "android.permission.CAMERA",
+              "android.permission.RECORD_AUDIO",
+              "android.permission.MODIFY_AUDIO_SETTINGS"
+            ];
+            for (const p of perms) {
+              if (!xml.includes(p)) {
+                xml = xml.replace("</manifest>", `    <uses-permission android:name="${p}" />\n</manifest>`);
+              }
+            }
+            fs.writeFileSync(path, xml);
+          ' "$MANIFEST"
+
+          GRADLE="android/app/build.gradle"
+          node -e '
+            const fs = require("fs");
+            const path = process.argv[1];
+            const buildNum = process.argv[2];
+            const verName = process.argv[3];
+            let gradle = fs.readFileSync(path, "utf8");
+            gradle = gradle.replace(/versionCode\s+\d+/, `versionCode ${buildNum}`);
+            gradle = gradle.replace(/versionName\s+"[^"]+"/, `versionName "${verName}"`);
+            if (!gradle.includes("signingConfigs")) {
+              const signingBlock = `
+    signingConfigs {
+        release {
+            storeFile file("release.keystore")
+            storePassword System.getenv("KEYSTORE_PASS") ?: "masterok_beta_keystore"
+            keyAlias System.getenv("KEY_ALIAS") ?: "masterok"
+            keyPassword System.getenv("KEY_PASS") ?: "masterok_beta_keystore"
+        }
+    }
+`;
+              gradle = gradle.replace("buildTypes {", signingBlock + "\n    buildTypes {");
+              gradle = gradle.replace(
+                /buildTypes\s*\{\s*release\s*\{/,
+                "buildTypes {\n        release {\n            signingConfig signingConfigs.release"
+              );
+            }
+            fs.writeFileSync(path, gradle);
+          ' "$GRADLE" "${{ steps.meta.outputs.build_number }}" "${{ steps.meta.outputs.version_name }}"
+
+      - name: Prepare Android signing keystore
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          KEYSTORE_PATH="android/app/release.keystore"
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$KEYSTORE_PATH"
+          else
+            keytool -genkeypair -v \
+              -keystore "$KEYSTORE_PATH" \
+              -storepass "masterok_beta_keystore" \
+              -alias "masterok" \
+              -keypass "masterok_beta_keystore" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=MasterOK Beta, O=MasterOK, C=RU"
+          fi
+
+      - name: Build signed Release APK
+        shell: bash
+        env:
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease
+          cd ..
+
+          RELEASE_DIR="android/app/build/outputs/apk/release"
+          OUT_APK="${{ steps.meta.outputs.apk_filename }}"
+
+          if [ -f "$RELEASE_DIR/app-release.apk" ]; then
+            cp "$RELEASE_DIR/app-release.apk" "$OUT_APK"
+          elif [ -f "$RELEASE_DIR/app-release-unsigned.apk" ]; then
+            BUILD_TOOLS_DIR=$(ls -d "$ANDROID_HOME/build-tools/"* | sort -V | tail -1)
+            "$BUILD_TOOLS_DIR/zipalign" -f -p 4 "$RELEASE_DIR/app-release-unsigned.apk" "aligned-release.apk"
+            KS_PASS="${KEYSTORE_PASS:-masterok_beta_keystore}"
+            K_ALIAS="${KEY_ALIAS:-masterok}"
+            K_PASS="${KEY_PASS:-masterok_beta_keystore}"
+            "$BUILD_TOOLS_DIR/apksigner" sign \
+              --ks "android/app/release.keystore" \
+              --ks-pass "pass:${KS_PASS}" \
+              --ks-key-alias "${K_ALIAS}" \
+              --key-pass "pass:${K_PASS}" \
+              --out "$OUT_APK" \
+              "aligned-release.apk"
+            rm -f "aligned-release.apk"
+          else
+            echo "Release APK not found in $RELEASE_DIR"
+            ls -la "$RELEASE_DIR" || true
+            exit 1
+          fi
+
+          ls -lh "$OUT_APK"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.apk_filename }}
+          path: ${{ steps.meta.outputs.apk_filename }}
+          retention-days: 30
+
+      - name: Create GitHub Beta Pre-release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.meta.outputs.tag_name }}
+          name: "МастерОК Beta ${{ steps.meta.outputs.tag_name }} (Build #${{ steps.meta.outputs.build_number }})"
+          prerelease: true
+          generate_release_notes: true
+          body: |
+            ${{ inputs.release_notes || 'Автоматическая бета-сборка Android APK для МастерОК (HomeGenie).' }}
+
+            - **Версия (`versionName`)**: `${{ steps.meta.outputs.version_name }}`
+            - **Номер сборки (`versionCode`)**: `${{ steps.meta.outputs.build_number }}`
+            - **Коммит**: `${{ github.sha }}`
+            - **Файл**: `${{ steps.meta.outputs.apk_filename }}`
+          files: |
+            ${{ steps.meta.outputs.apk_filename }}
