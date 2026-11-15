@@ -9,6 +9,9 @@ import {
   mapCocoClassToTarget,
   buildCumulativeSavingsSeries,
   filterLocalMasters,
+  computeCenterCropRect,
+  applyBrightnessContrast,
+  isLowConfidence,
   Recipe,
   ApplianceItem,
   LocalMaster,
@@ -199,3 +202,35 @@ test('estimateUpcyclingValue calculates ROI and added value', () => {
   assert.equal(result.addedValue, 2100);
   assert.ok(result.roiPercentage > 100);
 });
+
+test('computeCenterCropRect crops center and preserves aspect ratio within maxEdge', () => {
+  const rect = computeCenterCropRect(2000, 1000, 0.78, 1024);
+  assert.equal(rect.sw, 1560);
+  assert.equal(rect.sh, 780);
+  assert.equal(rect.sx, 220);
+  assert.equal(rect.sy, 110);
+  assert.equal(rect.targetW, 1024);
+  assert.equal(rect.targetH, 512);
+
+  const full = computeCenterCropRect(800, 600, 1.0, 1024);
+  assert.equal(full.sx, 0);
+  assert.equal(full.sy, 0);
+  assert.equal(full.targetW, 800);
+  assert.equal(full.targetH, 600);
+});
+
+test('applyBrightnessContrast adjusts pixel luminance and contrast cleanly', () => {
+  const pixels = new Uint8ClampedArray([100, 150, 200, 255]);
+  applyBrightnessContrast(pixels, 110, 120);
+  assert.equal(pixels[3], 255); // alpha preserved
+  assert.ok(pixels[0] > 100 && pixels[0] <= 255);
+  assert.ok(pixels[2] > 200 && pixels[2] <= 255);
+});
+
+test('isLowConfidence flags scores strictly below 75%', () => {
+  assert.equal(isLowConfidence(0.74), true);
+  assert.equal(isLowConfidence(0.5), true);
+  assert.equal(isLowConfidence(0.75), false);
+  assert.equal(isLowConfidence(0.94), false);
+});
+

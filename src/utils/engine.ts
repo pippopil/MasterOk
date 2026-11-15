@@ -352,3 +352,62 @@ export function estimateUpcyclingValue(
     roiPercentage: roi,
   };
 }
+
+export const CONFIDENCE_WARNING_THRESHOLD = 0.75;
+
+export function isLowConfidence(confidence: number): boolean {
+  return !Number.isFinite(confidence) || confidence < CONFIDENCE_WARNING_THRESHOLD;
+}
+
+/**
+ * Расчёт прямоугольника автоматической обрезки (crop) по центру кадра
+ * с сохранением масштаба не выше maxEdge по длинной стороне.
+ */
+export function computeCenterCropRect(
+  srcWidth: number,
+  srcHeight: number,
+  cropRatio: number = 0.78,
+  maxEdge: number = 1024
+): {
+  sx: number;
+  sy: number;
+  sw: number;
+  sh: number;
+  targetW: number;
+  targetH: number;
+} {
+  const safeW = Math.max(1, Math.round(srcWidth));
+  const safeH = Math.max(1, Math.round(srcHeight));
+  const ratio = Math.min(1, Math.max(0.3, cropRatio));
+
+  const sw = Math.max(1, Math.round(safeW * ratio));
+  const sh = Math.max(1, Math.round(safeH * ratio));
+  const sx = Math.max(0, Math.floor((safeW - sw) / 2));
+  const sy = Math.max(0, Math.floor((safeH - sh) / 2));
+
+  const scale = Math.min(1, maxEdge / Math.max(sw, sh));
+  const targetW = Math.max(1, Math.round(sw * scale));
+  const targetH = Math.max(1, Math.round(sh * scale));
+
+  return { sx, sy, sw, sh, targetW, targetH };
+}
+
+/**
+ * Настройка яркости (brightnessPct, 100 = без изменений) и контрастности (contrastPct, 100 = без изменений)
+ * на массиве RGBA пикселей для усиления читаемости мелких деталей техники.
+ */
+export function applyBrightnessContrast(
+  pixels: Uint8ClampedArray,
+  brightnessPct: number = 108,
+  contrastPct: number = 118
+): void {
+  const brightnessOffset = ((brightnessPct - 100) / 100) * 255;
+  const contrastFactor = contrastPct / 100;
+
+  for (let i = 0; i < pixels.length; i += 4) {
+    for (let c = 0; c < 3; c++) {
+      const shifted = (pixels[i + c] - 128) * contrastFactor + 128 + brightnessOffset;
+      pixels[i + c] = shifted < 0 ? 0 : shifted > 255 ? 255 : Math.round(shifted);
+    }
+  }
+}

@@ -5,6 +5,12 @@ import { detectObjectOnDevice, DetectionResult, warmCocoSsd } from '../lib/ml';
 import { APP_IMAGES, POPULAR_GUIDES } from '../data/mockData';
 import { useAppStore } from '../store/useAppStore';
 import {
+  applyBrightnessContrast,
+  computeCenterCropRect,
+  CONFIDENCE_WARNING_THRESHOLD,
+  isLowConfidence,
+} from '../utils/engine';
+import {
   ScanLine,
   Wrench,
   Leaf,
@@ -14,10 +20,83 @@ import {
   RotateCcw,
   CheckCircle2,
   MapPin,
+  Crop,
+  SlidersHorizontal,
 } from 'lucide-react';
 
 const API_BASE = ((import.meta as any).env?.VITE_API_BASE_URL || '').replace(/\/+$/, '');
 const VALID_GUIDE_IDS = new Set(POPULAR_GUIDES.map((g) => g.id));
+
+interface PreprocessOptions {
+  centerCrop: boolean;
+  brightness: number;
+  contrast: number;
+}
+
+interface PreprocessResult {
+  imageData: string;
+  appliedSummary: string;
+}
+
+async function preprocessImageForAI(
+  sourceDataUrl: string,
+  options: PreprocessOptions
+): Promise<PreprocessResult> {
+  const { centerCrop, brightness, contrast } = options;
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  img.src = sourceDataUrl;
+
+  await new Promise<void>((resolve, reject) => {
+    img.onload = () => resolve();
+    img.onerror = () => reject(new Error('Не удалось декодировать изображение'));
+  });
+
+  const srcW = img.naturalWidth || img.width || 800;
+  const srcH = img.naturalHeight || img.height || 600;
+  const rect = computeCenterCropRect(srcW, srcH, centerCrop ? 0.78 : 1.0, 1024);
+
+  const canvas = document.createElement('canvas');
+  canvas.width = rect.targetW;
+  canvas.height = rect.targetH;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    return { imageData: sourceDataUrl, appliedSummary: 'Без предобработки' };
+  }
+
+  ctx.drawImage(
+    img,
+    rect.sx,
+    rect.sy,
+    rect.sw,
+    rect.sh,
+    0,
+    0,
+    rect.targetW,
+    rect.targetH
+  );
+
+  if (brightness !== 100 || contrast !== 100) {
+    try {
+      const frame = ctx.getImageData(0, 0, rect.targetW, rect.targetH);
+      applyBrightnessContrast(frame.data, brightness, contrast);
+      ctx.putImageData(frame, 0, 0);
+    } catch {
+      // Игнорируем ограничения tainted canvas для внешних URL
+    }
+  }
+
+  const processedDataUrl = canvas.toDataURL('image/jpeg', 0.88);
+  const parts: string[] = [];
+  if (centerCrop) parts.push('обрезка центра 78%');
+  parts.push(`яркость ${brightness}%`);
+  parts.push(`контраст ${contrast}%`);
+
+  return {
+    imageData: processedDataUrl,
+    appliedSummary: parts.join(' · '),
+  };
+}
 
 interface ScanOutcome {
   label: string;
@@ -33,6 +112,7 @@ interface ScanOutcome {
   inferenceMs: number;
   detections: DetectionResult[];
   source: string;
+  preprocessingInfo?: string;
   unrecognized?: boolean;
 }
 
@@ -44,11 +124,18 @@ export const ObjectDetector: React.FC = () => {
   const addScanRecord = useAppStore((s) => s.addScanRecord);
 
   const [mode, setMode] = useState<'appliance' | 'upcycling' | 'fridge'>('appliance');
+  const [rawCapturedImage, setRawCapturedImage] = useState<string | null>(null);
   const [capturedImage, setCapturedImage] = useState<string | null>(null);
+  const [showOriginalPreview, setShowOriginalPreview] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [cameraErrorMsg, setCameraErrorMsg] = useState<string | null>(null);
   const [outcome, setOutcome] = useState<ScanOutcome | null>(null);
   const [lowConfidenceWarning, setLowConfidenceWarning] = useState(false);
+
+  // Параметры предобработки кадра перед отправкой в AI-модель
+  const [centerCrop, setCenterCrop] = useState(true);
+  const [brightness, setBrightness] = useState(108);
+  const [contrast, setContrast] = useState(118);
 
   const presets = [
     {
@@ -96,9 +183,13 @@ export const ObjectDetector: React.FC = () => {
   const runDetectionPipeline = async (
     imageData: string,
     activeMode: 'appliance' | 'upcycling' | 'fridge',
-    presetHint?: (typeof presets)[0]
+    presetHint?: (typeof presets)[0],
+    overridePreprocess?: PreprocessOptions
   ) => {
+    const preprocessOpts = overridePreprocess || { centerCrop, brightness, contrast };
+    setRawCapturedImage(imageData);
     setCapturedImage(imageData);
+    setShowOriginalPreview(false);
     setIsAnalyzing(true);
     setOutcome(null);
     setLowConfidenceWarning(false);
@@ -106,6 +197,18 @@ export const ObjectDetector: React.FC = () => {
     const startedAt = performance.now();
 
     try {
+      // Предварительная обработка: авто-обрезка центра и усиление яркости/контраста
+      let processedPayload = imageData;
+      let preprocessingInfo = 'Без предобработки';
+      try {
+        const preprocessed = await preprocessImageForAI(imageData, preprocessOpts);
+        processedPayload = preprocessed.imageData;
+        preprocessingInfo = preprocessed.appliedSummary;
+        setCapturedImage(processedPayload);
+      } catch {
+        processedPayload = imageData;
+      }
+
       // Быстрый путь для демонстрационных карточек-пресетов
       if (presetHint) {
         const finalOutcome: ScanOutcome = {
@@ -127,6 +230,7 @@ export const ObjectDetector: React.FC = () => {
           inferenceMs: Math.round(performance.now() - startedAt),
           detections: [],
           source: 'Демонстрационный образец',
+          preprocessingInfo,
         };
         setOutcome(finalOutcome);
         addScanRecord({
@@ -140,12 +244,12 @@ export const ObjectDetector: React.FC = () => {
         return;
       }
 
-      // Параллельный запуск локального TensorFlow.js COCO-SSD и серверного Vision (Gemini)
-      const localMlPromise = detectObjectOnDevice(imageData);
+      // Параллельный запуск локального TensorFlow.js COCO-SSD и серверного Vision (Gemini) на обработанном кадре
+      const localMlPromise = detectObjectOnDevice(processedPayload);
       const serverFetchPromise = fetch(`${API_BASE}/api/analyze-image`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image: imageData, mode: activeMode }),
+        body: JSON.stringify({ image: processedPayload, mode: activeMode }),
       })
         .then(async (r) => {
           const body = await r.json().catch(() => null);
@@ -182,7 +286,8 @@ export const ObjectDetector: React.FC = () => {
           guideId: null,
           inferenceMs: totalMs,
           detections: [],
-          source: json?.error || 'Попробуйте сделать более чёткое фото при хорошем освещении',
+          source: json?.error || 'Попробуйте сменить ракурс или улучшить освещение',
+          preprocessingInfo,
           unrecognized: true,
         });
         return;
@@ -215,7 +320,7 @@ export const ObjectDetector: React.FC = () => {
           ? activeMode
           : topLocal?.targetMode || activeMode;
 
-      if (confidence < 0.7) {
+      if (isLowConfidence(confidence)) {
         setLowConfidenceWarning(true);
       }
 
@@ -241,6 +346,7 @@ export const ObjectDetector: React.FC = () => {
             ? 'Gemini Vision + TensorFlow.js'
             : 'Gemini Vision'
           : 'TensorFlow.js COCO-SSD (локально)',
+        preprocessingInfo,
       };
 
       setOutcome(finalOutcome);
@@ -283,7 +389,9 @@ export const ObjectDetector: React.FC = () => {
   };
 
   const resetScanner = () => {
+    setRawCapturedImage(null);
     setCapturedImage(null);
+    setShowOriginalPreview(false);
     setOutcome(null);
     setLowConfidenceWarning(false);
     setCameraErrorMsg(null);
@@ -301,7 +409,7 @@ export const ObjectDetector: React.FC = () => {
             Сканирование техники, мебели и продуктов
           </h1>
           <p className="text-sm text-slate-400 leading-relaxed">
-            Сделайте фото через камеру браузера или выберите тестовый снимок. При точности ниже 70% доступен быстрый ручной выбор модели.
+            Сделайте фото через камеру браузера или выберите тестовый снимок. Перед отправкой в AI кадр автоматически обрезается по центру с коррекцией яркости и контрастности. При уверенности ниже {Math.round(CONFIDENCE_WARNING_THRESHOLD * 100)}% доступен ручной выбор модели.
           </p>
         </div>
 
@@ -345,7 +453,7 @@ export const ObjectDetector: React.FC = () => {
 
       {/* Main Split Workspace */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-        {/* Left: Camera / Captured Image */}
+        {/* Left: Camera / Captured Image + Preprocessing Controls */}
         <div className="lg:col-span-7 space-y-4">
           {!capturedImage ? (
             <Camera
@@ -355,7 +463,7 @@ export const ObjectDetector: React.FC = () => {
           ) : (
             <div className="relative w-full h-[360px] sm:h-[440px] rounded-2xl overflow-hidden bg-slate-950 border border-slate-800">
               <SafeImage
-                src={capturedImage}
+                src={showOriginalPreview && rawCapturedImage ? rawCapturedImage : capturedImage}
                 alt="Снимок объекта"
                 className="w-full h-full object-cover"
               />
@@ -363,25 +471,112 @@ export const ObjectDetector: React.FC = () => {
                 <div className="absolute inset-0 bg-slate-950/80 backdrop-blur-sm flex flex-col items-center justify-center gap-3 p-6 text-center">
                   <ScanLine className="w-8 h-8 text-cyan-400 animate-pulse" />
                   <div className="text-sm font-semibold text-white">
-                    Распознавание объекта (TensorFlow.js COCO-SSD)...
+                    Предобработка кадра и распознавание объекта...
                   </div>
                   <div className="text-xs text-slate-400">
-                    Анализ категории, модели и возможных неисправностей
+                    Авто-обрезка центра, коррекция яркости/контраста, Gemini Vision + TensorFlow.js
                   </div>
                 </div>
               )}
               {!isAnalyzing && (
-                <button
-                  type="button"
-                  onClick={resetScanner}
-                  className="absolute top-3 right-3 min-h-[40px] px-3.5 py-2 rounded-xl bg-slate-900/90 hover:bg-slate-800 text-slate-200 border border-slate-700 text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0"
-                >
-                  <RotateCcw className="w-3.5 h-3.5" />
-                  <span>Переснять</span>
-                </button>
+                <div className="absolute top-3 right-3 flex items-center gap-2">
+                  {rawCapturedImage && (
+                    <button
+                      type="button"
+                      onClick={() => setShowOriginalPreview((v) => !v)}
+                      className="min-h-[40px] px-3 py-2 rounded-xl bg-slate-900/90 hover:bg-slate-800 text-slate-200 border border-slate-700 text-xs font-medium whitespace-nowrap shrink-0"
+                    >
+                      {showOriginalPreview ? 'Показать после обработки' : 'Показать исходник'}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={resetScanner}
+                    className="min-h-[40px] px-3.5 py-2 rounded-xl bg-slate-900/90 hover:bg-slate-800 text-slate-200 border border-slate-700 text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>Переснять</span>
+                  </button>
+                </div>
               )}
             </div>
           )}
+
+          {/* Image Preprocessing Bar */}
+          <div className="p-4 rounded-2xl bg-slate-900 border border-slate-800 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-xs font-semibold text-slate-200">
+                <SlidersHorizontal className="w-4 h-4 text-cyan-400" />
+                <span>Предобработка кадра перед AI-моделью</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setCenterCrop((v) => !v)}
+                  aria-pressed={centerCrop}
+                  className={`min-h-[36px] px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 border transition-colors whitespace-nowrap ${
+                    centerCrop
+                      ? 'bg-cyan-500/15 border-cyan-500/50 text-cyan-300'
+                      : 'bg-slate-950 border-slate-700 text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <Crop className="w-3.5 h-3.5" />
+                  <span>{centerCrop ? 'Авто-обрезка центра (78%)' : 'Полный кадр (100%)'}</span>
+                </button>
+                {rawCapturedImage && !isAnalyzing && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      runDetectionPipeline(rawCapturedImage, mode, undefined, {
+                        centerCrop,
+                        brightness,
+                        contrast,
+                      })
+                    }
+                    className="min-h-[36px] px-3 py-1.5 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-xs font-bold whitespace-nowrap transition-colors"
+                  >
+                    Повторить анализ
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-1">
+              <label className="space-y-1.5 block">
+                <div className="flex items-center justify-between text-xs text-slate-400">
+                  <span>Яркость</span>
+                  <span className="font-mono tabular-nums text-slate-200">{brightness}%</span>
+                </div>
+                <input
+                  type="range"
+                  min={80}
+                  max={140}
+                  step={2}
+                  value={brightness}
+                  onChange={(e) => setBrightness(Number(e.target.value))}
+                  aria-label="Яркость изображения"
+                  className="w-full accent-cyan-400 cursor-pointer"
+                />
+              </label>
+
+              <label className="space-y-1.5 block">
+                <div className="flex items-center justify-between text-xs text-slate-400">
+                  <span>Контрастность деталей</span>
+                  <span className="font-mono tabular-nums text-slate-200">{contrast}%</span>
+                </div>
+                <input
+                  type="range"
+                  min={80}
+                  max={150}
+                  step={2}
+                  value={contrast}
+                  onChange={(e) => setContrast(Number(e.target.value))}
+                  aria-label="Контрастность изображения"
+                  className="w-full accent-cyan-400 cursor-pointer"
+                />
+              </label>
+            </div>
+          </div>
 
           {cameraErrorMsg && !capturedImage && (
             <p className="text-xs text-amber-400">
@@ -394,16 +589,24 @@ export const ObjectDetector: React.FC = () => {
         <div className="lg:col-span-5 space-y-5">
           {outcome ? (
             <div className="p-6 rounded-2xl bg-slate-900 border border-slate-800 space-y-5">
-              {lowConfidenceWarning && (
-                <div className="p-3 rounded-xl bg-amber-950/50 border border-amber-500/40 text-amber-200 text-xs flex items-start gap-2.5">
+              {(lowConfidenceWarning || isLowConfidence(outcome.confidence)) && (
+                <div
+                  role="alert"
+                  className="p-3.5 rounded-xl bg-amber-950/50 border border-amber-500/40 text-amber-200 text-xs flex items-start gap-2.5"
+                >
                   <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
-                  <span>
-                    Уверенность ниже 70% — проверьте распознанный объект или выберите модель вручную из списка ниже.
-                  </span>
+                  <div className="space-y-1">
+                    <div className="font-semibold text-amber-100">
+                      Уверенность распознавания ниже 75%
+                    </div>
+                    <div>
+                      Попробуйте сменить ракурс или улучшить освещение — это поможет снизить риск ошибки. Также можно скорректировать яркость/контраст или выбрать модель вручную ниже.
+                    </div>
+                  </div>
                 </div>
               )}
 
-              <div className="space-y-1.5">
+              <div className="space-y-2.5">
                 <div className="flex items-center justify-between gap-2 text-xs text-slate-400">
                   <span
                     className={`flex items-center gap-1.5 font-medium ${
@@ -417,17 +620,47 @@ export const ObjectDetector: React.FC = () => {
                     )}
                     {outcome.unrecognized ? 'Требуется уточнение' : 'Объект распознан'}
                   </span>
-                  <span className="font-mono tabular-nums text-slate-300">
-                    {outcome.confidence > 0 ? `${Math.round(outcome.confidence * 100)}% · ` : ''}
+                  <span className="font-mono tabular-nums text-slate-400">
                     {outcome.inferenceMs} мс
                   </span>
                 </div>
                 <h2 className="text-xl font-bold text-white">{outcome.label}</h2>
-                <p className="text-xs text-slate-400">
+
+                {/* Explicit Confidence Score Readout */}
+                <div className="pt-1 space-y-1.5">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-slate-400">Коэффициент уверенности</span>
+                    <span
+                      data-testid="confidence-score-value"
+                      className={`font-mono font-semibold tabular-nums ${
+                        isLowConfidence(outcome.confidence) ? 'text-amber-300' : 'text-emerald-400'
+                      }`}
+                    >
+                      {Math.round(outcome.confidence * 100)}% ({outcome.confidence.toFixed(2)})
+                    </span>
+                  </div>
+                  <div className="w-full h-1.5 rounded-full bg-slate-800 overflow-hidden">
+                    <div
+                      className={`h-full rounded-full transition-all duration-300 ${
+                        isLowConfidence(outcome.confidence) ? 'bg-amber-400' : 'bg-emerald-400'
+                      }`}
+                      style={{
+                        width: `${Math.max(0, Math.min(100, Math.round(outcome.confidence * 100)))}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+
+                <p className="text-xs text-slate-400 pt-1">
                   Источник: {outcome.source}
                   {outcome.brand ? ` · ${outcome.brand}` : ''}
                   {outcome.model ? ` ${outcome.model}` : ''}
                 </p>
+                {outcome.preprocessingInfo && (
+                  <p className="text-[11px] text-slate-500">
+                    Предобработка: {outcome.preprocessingInfo}
+                  </p>
+                )}
                 {outcome.detections.length > 0 && (
                   <p className="text-[11px] text-slate-400">
                     TF.js объекты в кадре:{' '}
