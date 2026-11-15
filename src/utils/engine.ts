@@ -91,40 +91,76 @@ export function parseRoute(pathname: string): AppRoute {
   return { page: 'home' };
 }
 
+const COCO_TRANSLATIONS: Record<
+  string,
+  {
+    labelRu: string;
+    targetMode: 'appliance' | 'upcycling' | 'fridge';
+    suggestedGuideId: string | null;
+  }
+> = {
+  microwave: {
+    labelRu: 'Микроволновая печь',
+    targetMode: 'appliance',
+    suggestedGuideId: 'samsung-mw-fuse',
+  },
+  oven: { labelRu: 'Духовой шкаф / плита', targetMode: 'appliance', suggestedGuideId: null },
+  toaster: { labelRu: 'Тостер', targetMode: 'appliance', suggestedGuideId: null },
+  refrigerator: { labelRu: 'Холодильник', targetMode: 'fridge', suggestedGuideId: null },
+  sink: { labelRu: 'Раковина / сантехника', targetMode: 'appliance', suggestedGuideId: null },
+  tv: { labelRu: 'Телевизор / монитор', targetMode: 'appliance', suggestedGuideId: null },
+  laptop: { labelRu: 'Ноутбук', targetMode: 'appliance', suggestedGuideId: null },
+  mouse: { labelRu: 'Компьютерная мышь', targetMode: 'appliance', suggestedGuideId: null },
+  keyboard: { labelRu: 'Клавиатура', targetMode: 'appliance', suggestedGuideId: null },
+  remote: { labelRu: 'Пульт дистанционного управления', targetMode: 'appliance', suggestedGuideId: null },
+  'cell phone': { labelRu: 'Смартфон', targetMode: 'appliance', suggestedGuideId: null },
+  'hair drier': { labelRu: 'Фен', targetMode: 'appliance', suggestedGuideId: null },
+  clock: { labelRu: 'Часы', targetMode: 'upcycling', suggestedGuideId: null },
+  chair: { labelRu: 'Деревянный / офисный стул', targetMode: 'upcycling', suggestedGuideId: 'chair-upcycling' },
+  couch: { labelRu: 'Диван / кресло', targetMode: 'upcycling', suggestedGuideId: null },
+  'dining table': { labelRu: 'Стол', targetMode: 'upcycling', suggestedGuideId: null },
+  bed: { labelRu: 'Кровать / каркас мебели', targetMode: 'upcycling', suggestedGuideId: null },
+  bench: { labelRu: 'Скамья / табурет', targetMode: 'upcycling', suggestedGuideId: 'chair-upcycling' },
+  'potted plant': { labelRu: 'Комнатное растение', targetMode: 'upcycling', suggestedGuideId: null },
+  vase: { labelRu: 'Ваза', targetMode: 'upcycling', suggestedGuideId: null },
+  book: { labelRu: 'Книга', targetMode: 'upcycling', suggestedGuideId: null },
+  bottle: { labelRu: 'Бутылка / напиток', targetMode: 'fridge', suggestedGuideId: null },
+  'wine glass': { labelRu: 'Бокал', targetMode: 'fridge', suggestedGuideId: null },
+  cup: { labelRu: 'Чашка / кружка', targetMode: 'fridge', suggestedGuideId: null },
+  bowl: { labelRu: 'Миска / тарелка', targetMode: 'fridge', suggestedGuideId: null },
+  banana: { labelRu: 'Банан', targetMode: 'fridge', suggestedGuideId: null },
+  apple: { labelRu: 'Яблоко', targetMode: 'fridge', suggestedGuideId: null },
+  sandwich: { labelRu: 'Сэндвич', targetMode: 'fridge', suggestedGuideId: null },
+  orange: { labelRu: 'Апельсин', targetMode: 'fridge', suggestedGuideId: null },
+  broccoli: { labelRu: 'Брокколи', targetMode: 'fridge', suggestedGuideId: null },
+  carrot: { labelRu: 'Морковь', targetMode: 'fridge', suggestedGuideId: null },
+  pizza: { labelRu: 'Пицца', targetMode: 'fridge', suggestedGuideId: null },
+  donut: { labelRu: 'Выпечка / пончик', targetMode: 'fridge', suggestedGuideId: null },
+  cake: { labelRu: 'Торт / десерт', targetMode: 'fridge', suggestedGuideId: null },
+  backpack: { labelRu: 'Рюкзак', targetMode: 'upcycling', suggestedGuideId: null },
+  handbag: { labelRu: 'Сумка', targetMode: 'upcycling', suggestedGuideId: null },
+  bicycle: { labelRu: 'Велосипед', targetMode: 'appliance', suggestedGuideId: null },
+  scissors: { labelRu: 'Ножницы', targetMode: 'upcycling', suggestedGuideId: null },
+  toothbrush: { labelRu: 'Зубная щётка', targetMode: 'appliance', suggestedGuideId: null },
+  person: { labelRu: 'Человек в кадре', targetMode: 'appliance', suggestedGuideId: null },
+};
+
 /**
  * Сопоставление классов COCO-SSD (TensorFlow.js) с категориями МастерОК
  */
 export function mapCocoClassToTarget(cocoClass: string): {
   labelRu: string;
   targetMode: 'appliance' | 'upcycling' | 'fridge';
-  suggestedGuideId: string;
+  suggestedGuideId: string | null;
 } {
-  const cls = cocoClass.toLowerCase();
-  if (cls === 'microwave' || cls === 'oven' || cls === 'toaster') {
-    return {
-      labelRu: cls === 'microwave' ? 'Микроволновая печь' : 'Кухонная техника',
-      targetMode: 'appliance',
-      suggestedGuideId: 'samsung-mw-fuse',
-    };
-  }
-  if (cls === 'refrigerator') {
-    return {
-      labelRu: 'Холодильник',
-      targetMode: 'fridge',
-      suggestedGuideId: 'lg-wm-filter',
-    };
-  }
-  if (cls === 'chair' || cls === 'couch' || cls === 'dining table' || cls === 'bed') {
-    return {
-      labelRu: cls === 'chair' ? 'Деревянный стул' : 'Предмет мебели',
-      targetMode: 'upcycling',
-      suggestedGuideId: 'chair-upcycling',
-    };
+  const cls = cocoClass.trim().toLowerCase();
+  if (COCO_TRANSLATIONS[cls]) {
+    return COCO_TRANSLATIONS[cls];
   }
   return {
-    labelRu: 'Бытовая техника',
+    labelRu: cls ? `Объект (${cls})` : 'Неизвестный объект',
     targetMode: 'appliance',
-    suggestedGuideId: 'lg-wm-filter',
+    suggestedGuideId: null,
   };
 }
 

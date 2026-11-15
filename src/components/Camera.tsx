@@ -56,15 +56,32 @@ export function Camera({ onCapture, onError, autoStart = false }: CameraProps) {
     };
   }, [autoStart]);
 
-  const captureImage = () => {
-    if (!videoRef.current) return;
+  const resizeToJpeg = (
+    source: HTMLVideoElement | HTMLImageElement,
+    srcWidth: number,
+    srcHeight: number
+  ): string | null => {
+    const maxEdge = 1024;
+    const scale = Math.min(1, maxEdge / Math.max(srcWidth, srcHeight));
+    const targetW = Math.max(1, Math.round(srcWidth * scale));
+    const targetH = Math.max(1, Math.round(srcHeight * scale));
     const canvas = document.createElement('canvas');
-    canvas.width = videoRef.current.videoWidth || 640;
-    canvas.height = videoRef.current.videoHeight || 480;
+    canvas.width = targetW;
+    canvas.height = targetH;
     const ctx = canvas.getContext('2d');
-    if (ctx) {
-      ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
-      const imageData = canvas.toDataURL('image/jpeg', 0.85);
+    if (!ctx) return null;
+    ctx.drawImage(source, 0, 0, targetW, targetH);
+    return canvas.toDataURL('image/jpeg', 0.85);
+  };
+
+  const captureImage = () => {
+    const video = videoRef.current;
+    if (!video || video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0) {
+      onError(new Error('Камера ещё инициализирует кадр, подождите 1 секунду'));
+      return;
+    }
+    const imageData = resizeToJpeg(video, video.videoWidth, video.videoHeight);
+    if (imageData) {
       stopCamera();
       onCapture(imageData);
     }
@@ -72,14 +89,32 @@ export function Camera({ onCapture, onError, autoStart = false }: CameraProps) {
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
+
     const reader = new FileReader();
     reader.onload = (ev) => {
-      const res = ev.target?.result;
-      if (typeof res === 'string') {
+      const rawDataUrl = ev.target?.result;
+      if (typeof rawDataUrl !== 'string') return;
+
+      const img = new Image();
+      img.onload = () => {
+        const normalized = resizeToJpeg(
+          img,
+          img.naturalWidth || 800,
+          img.naturalHeight || 600
+        );
         stopCamera();
-        onCapture(res);
-      }
+        onCapture(normalized || rawDataUrl);
+      };
+      img.onerror = () => {
+        stopCamera();
+        onCapture(rawDataUrl);
+      };
+      img.src = rawDataUrl;
+    };
+    reader.onerror = () => {
+      onError(new Error('Не удалось прочитать выбранный файл'));
     };
     reader.readAsDataURL(file);
   };

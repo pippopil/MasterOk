@@ -220,7 +220,17 @@ export const ProfileDashboard: React.FC = () => {
                 </div>
                 <button
                   type="button"
-                  onClick={() => navigate(`/repair/${item.guideId}`)}
+                  onClick={() =>
+                    navigate(
+                      item.guideId
+                        ? `/repair/${item.guideId}`
+                        : item.mode === 'fridge'
+                        ? '/recipes'
+                        : item.mode === 'upcycling'
+                        ? '/upcycle'
+                        : '/masters'
+                    )
+                  }
                   className="min-h-[38px] px-3 py-1.5 rounded-lg bg-slate-950 hover:bg-slate-800 border border-slate-700 text-xs font-semibold text-cyan-400 flex items-center gap-1 whitespace-nowrap shrink-0"
                 >
                   <span>Открыть</span>

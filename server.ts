@@ -19,10 +19,83 @@ const apiKey = process.env.GEMINI_API_KEY;
 let aiClient: GoogleGenAI | null = null;
 if (apiKey && apiKey !== 'MY_GEMINI_API_KEY') {
   try {
-    aiClient = new GoogleGenAI({ apiKey });
+    aiClient = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
   } catch (err) {
     console.warn('Could not initialize GoogleGenAI client:', err);
   }
+}
+
+const VALID_GUIDE_IDS = new Set([
+  'lg-wm-filter',
+  'samsung-mw-fuse',
+  'dyson-v11-clean',
+  'chair-upcycling',
+]);
+
+function parseImageDataUrl(dataUrl: string): { mimeType: string; data: string } | null {
+  const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+  if (!match) return null;
+  return { mimeType: match[1], data: match[2] };
+}
+
+async function generateContentWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Gemini timeout after ${timeoutMs}ms`)), timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
+async function callGeminiWithFallback(
+  parts: any[],
+  options?: { responseMimeType?: string }
+): Promise<string> {
+  if (!aiClient) {
+    throw new Error('GEMINI_API_KEY is not configured');
+  }
+  const attempts: { model: string; timeoutMs: number }[] = [
+    { model: 'gemini-4-hydrogen', timeoutMs: 5500 },
+    { model: 'gemini-3.1-flash-lite', timeoutMs: 12000 },
+  ];
+  let lastError: unknown = null;
+
+  for (const { model, timeoutMs } of attempts) {
+    try {
+      const response = await generateContentWithTimeout(
+        aiClient.models.generateContent({
+          model,
+          contents: [{ role: 'user', parts }],
+          ...(options?.responseMimeType
+            ? { config: { responseMimeType: options.responseMimeType } }
+            : {}),
+        }),
+        timeoutMs
+      );
+      if (response.text) {
+        return response.text;
+      }
+    } catch (err) {
+      lastError = err;
+      console.warn(`Gemini model ${model} failed:`, err instanceof Error ? err.message : err);
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error('All Gemini models failed');
 }
 
 interface StoredObjectRecord {
@@ -112,19 +185,14 @@ app.post('/api/upcycle-ideas', async (req: Request, res: Response) => {
           },
         ];
 
-        if (typeof imageData === 'string' && imageData.startsWith('data:image/')) {
-          const cleanBase64 = imageData.replace(/^data:image\/\w+;base64,/, '');
+        const parsedImage = typeof imageData === 'string' ? parseImageDataUrl(imageData) : null;
+        if (parsedImage) {
           parts.push({
-            inlineData: { mimeType: 'image/jpeg', data: cleanBase64 },
+            inlineData: { mimeType: parsedImage.mimeType, data: parsedImage.data },
           });
         }
 
-        const response = await aiClient.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents: [{ role: 'user', parts }],
-        });
-
-        const text = response.text || '';
+        const text = await callGeminiWithFallback(parts, { responseMimeType: 'application/json' });
         const jsonMatch = text.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
           const parsed = JSON.parse(jsonMatch[0]);
@@ -223,27 +291,24 @@ app.post('/api/recipes', async (req: Request, res: Response) => {
   try {
     const { imageData, ingredients = [] } = req.body || {};
 
-    if (aiClient && typeof imageData === 'string' && imageData.startsWith('data:image/')) {
+    const parsedRecipeImg =
+      typeof imageData === 'string' ? parseImageDataUrl(imageData) : null;
+    if (aiClient && parsedRecipeImg) {
       try {
-        const cleanBase64 = imageData.replace(/^data:image\/\w+;base64,/, '');
-        const response = await aiClient.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents: [
+        const text = await callGeminiWithFallback(
+          [
             {
-              role: 'user',
-              parts: [
-                {
-                  text: `Ты — шеф-повар Zero-Waste проекта "МастерОК". Распознай продукты на фото холодильника и предложи 3 простых вкусных рецепта из них.
+              text: `Ты — шеф-повар Zero-Waste проекта "МастерОК". Распознай продукты на фото и предложи 3 простых вкусных рецепта из них.
 Ответь строго в формате JSON:
 {
-  "detectedIngredients": ["яйца", "сыр", "помидоры", "молоко", "зелень"],
+  "detectedIngredients": ["продукт 1", "продукт 2"],
   "recipes": [
     {
       "id": "rec-1",
       "title": "Название блюда",
       "category": "Завтрак / Ужин",
-      "requiredIngredients": ["яйца", "сыр"],
-      "optionalIngredients": ["зелень"],
+      "requiredIngredients": ["продукт 1"],
+      "optionalIngredients": ["продукт 2"],
       "cookingTimeMinutes": 15,
       "difficulty": "Легко",
       "calories": 320,
@@ -254,16 +319,13 @@ app.post('/api/recipes', async (req: Request, res: Response) => {
     }
   ]
 }`,
-                },
-                {
-                  inlineData: { mimeType: 'image/jpeg', data: cleanBase64 },
-                },
-              ],
+            },
+            {
+              inlineData: { mimeType: parsedRecipeImg.mimeType, data: parsedRecipeImg.data },
             },
           ],
-        });
-
-        const text = response.text || '';
+          { responseMimeType: 'application/json' }
+        );
         const jsonMatch = text.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
           const parsed = JSON.parse(jsonMatch[0]);
@@ -351,122 +413,140 @@ app.post('/api/recipes', async (req: Request, res: Response) => {
   }
 });
 
-// API: Анализ изображения техники/мебели/холодильника
+// API: Анализ изображения техники/мебели/холодильника и любых бытовых объектов
 app.post('/api/analyze-image', async (req: Request, res: Response) => {
   try {
-    const { image, mode = 'appliance' } = req.body;
+    const { image, mode = 'appliance' } = req.body || {};
 
-    if (!image) {
-      res.status(400).json({ error: 'Image data is required' });
+    if (!image || typeof image !== 'string') {
+      res.status(400).json({ success: false, error: 'Image data is required' });
       return;
     }
 
-    if (aiClient && typeof image === 'string' && image.startsWith('data:image/')) {
-      try {
-        const cleanBase64 = image.replace(/^data:image\/\w+;base64,/, '');
-        const prompt =
-          mode === 'upcycling'
-            ? `Определи предмет мебели на фото и верни JSON:
+    const parsedImage = parseImageDataUrl(image);
+    if (!parsedImage) {
+      res.status(400).json({
+        success: false,
+        source: 'invalid_format',
+        error: 'Ожидается изображение в формате base64 data:image/*',
+      });
+      return;
+    }
+
+    if (!aiClient) {
+      res.status(503).json({
+        success: false,
+        source: 'unavailable',
+        error: 'Серверная модель Vision не настроена',
+      });
+      return;
+    }
+
+    const prompt =
+      mode === 'upcycling'
+        ? `Ты — эксперт по реставрации и апсайклингу проекта "МастерОК".
+Внимательно посмотри на фотографию и точно назови главный объект на русском языке (НЕ выдумывай предмет, которого нет на фото).
+Верни строго валидный JSON:
 {
-  "itemType": "Деревянный стул",
-  "material": "Массив бука",
-  "confidence": 0.91,
-  "suggestedGuideId": "chair-upcycling"
+  "category": "furniture",
+  "title": "Точное название предмета на русском",
+  "itemType": "Тип предмета на русском",
+  "material": "Предполагаемый материал (дерево, металл, ткань, пластик и т.д.)",
+  "confidence": 0.9,
+  "suggestedGuideId": null
+}
+Для suggestedGuideId укажи "chair-upcycling" ТОЛЬКО если на фото действительно стул/кресло/табурет, иначе верни null.`
+        : mode === 'fridge'
+        ? `Ты — шеф-повар Zero-Waste проекта "МастерОК".
+Внимательно посмотри на фото и перечисли ТОЛЬКО реально видимые на изображении продукты и ингредиенты на русском языке. Не выдумывай продукты, которых нет на фото.
+Верни строго валидный JSON:
+{
+  "category": "food",
+  "title": "Продукты на фото",
+  "detectedIngredients": ["продукт 1", "продукт 2"],
+  "confidence": 0.9,
+  "suggestedGuideId": null
 }`
-            : mode === 'fridge'
-            ? `Определи продукты на фото холодильника и верни JSON:
+        : `Ты — компьютерное зрение и эксперт-диагност проекта "МастерОК".
+Внимательно посмотри на фотографию и ОБЪЕКТИВНО определи, что именно изображено на фото (будь то микроволновка, пылесос, стиральная машина, холодильник, чайник, кофемашина, утюг, фен, телевизор, ноутбук, смартфон, стул, стол, посуда, продукты или любой другой узнаваемый предмет).
+КРИТИЧЕСКИ ВАЖНО:
+1. Никогда не отвечай «стиральная машина», если на фото изображён другой объект!
+2. Не придумывай бренд и модель, если они не читаются на фото — в этом случае укажи brand: null, model: null, year: null.
+3. Выбери category из списка: "washing_machine", "microwave", "vacuum", "refrigerator", "kettle", "coffee_machine", "electronics", "furniture", "food", "other".
+4. Поле suggestedGuideId заполняй ТОЛЬКО при точном совпадении типа объекта:
+   - "lg-wm-filter" — ТОЛЬКО если на фото стиральная машина
+   - "samsung-mw-fuse" — ТОЛЬКО если на фото микроволновая печь
+   - "dyson-v11-clean" — ТОЛЬКО если на фото пылесос
+   - "chair-upcycling" — ТОЛЬКО если на фото стул, кресло или табурет
+   Во всех остальных случаях ставь "suggestedGuideId": null.
+5. В detectedIssues перечисли 2–3 реальные типичные неисправности или рекомендации по уходу именно для распознанного объекта (или [] если это не техника/мебель).
+
+Ответь строго валидным JSON:
 {
-  "detectedIngredients": ["яйца", "сыр", "помидоры", "зелень"],
-  "confidence": 0.89
-}`
-            : `Ты — эксперт-диагност бытовой техники "МастерОК". Определи по фото тип техники, бренд, модель, год выпуска и частые неисправности.
-Ответь строго в формате JSON:
-{
-  "category": "washing_machine",
-  "brand": "LG",
-  "model": "F1296ND3",
-  "year": 2021,
-  "confidence": 0.94,
-  "title": "Стиральная машина LG F1296ND3",
-  "detectedIssues": ["Засор сливного фильтра (Ошибка OE)", "Износ щеток мотора"],
-  "estimatedMasterCost": 3500,
-  "estimatedPartsCost": 650,
-  "suggestedGuideId": "lg-wm-filter"
+  "category": "other",
+  "brand": null,
+  "model": null,
+  "year": null,
+  "confidence": 0.9,
+  "title": "Точное название объекта на русском",
+  "detectedIssues": ["Типовая проверка или неисправность 1", "Типовая проверка или неисправность 2"],
+  "estimatedMasterCost": 2200,
+  "estimatedPartsCost": 450,
+  "suggestedGuideId": null
 }`;
 
-        const response = await aiClient.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents: [
-            {
-              role: 'user',
-              parts: [
-                { text: prompt },
-                { inlineData: { mimeType: 'image/jpeg', data: cleanBase64 } },
-              ],
-            },
-          ],
-        });
-
-        const text = response.text || '';
-        const jsonMatch = text.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          const parsed = JSON.parse(jsonMatch[0]);
-          res.json({ success: true, data: parsed, source: 'gemini' });
-          return;
-        }
-      } catch (geminiError) {
-        console.warn('Gemini recognition fallback triggered:', geminiError);
-      }
-    }
-
-    if (mode === 'upcycling') {
-      res.json({
-        success: true,
-        source: 'smart-engine',
-        data: {
-          itemType: 'Венский стул (гнутый бук)',
-          material: 'Массив бука, фанера',
-          confidence: 0.91,
-          suggestedGuideId: 'chair-upcycling',
-        },
-      });
-      return;
-    }
-
-    if (mode === 'fridge') {
-      res.json({
-        success: true,
-        source: 'smart-engine',
-        data: {
-          detectedIngredients: ['яйца', 'сыр', 'помидоры', 'молоко', 'зелень'],
-          confidence: 0.89,
-        },
-      });
-      return;
-    }
-
-    res.json({
-      success: true,
-      source: 'smart-engine',
-      data: {
-        category: 'washing_machine',
-        brand: 'LG',
-        model: 'F1296ND3 Direct Drive',
-        year: 2021,
-        confidence: 0.94,
-        title: 'Стиральная машина LG F1296ND3',
-        detectedIssues: [
-          'Засор сливного фильтра (Ошибка OE)',
-          'Накипь на ТЭНе',
-          'Шум сливной помпы',
+    try {
+      const text = await callGeminiWithFallback(
+        [
+          { text: prompt },
+          { inlineData: { mimeType: parsedImage.mimeType, data: parsedImage.data } },
         ],
-        estimatedMasterCost: 3500,
-        estimatedPartsCost: 650,
-        suggestedGuideId: 'lg-wm-filter',
-      },
-    });
+        { responseMimeType: 'application/json' }
+      );
+
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        throw new Error('Gemini did not return valid JSON');
+      }
+
+      const parsed = JSON.parse(jsonMatch[0]);
+      const rawGuideId =
+        typeof parsed.suggestedGuideId === 'string' ? parsed.suggestedGuideId : null;
+      let safeGuideId = rawGuideId && VALID_GUIDE_IDS.has(rawGuideId) ? rawGuideId : null;
+
+      if (!safeGuideId) {
+        const cat = String(parsed.category || '').toLowerCase();
+        const titleLower = String(parsed.title || parsed.itemType || '').toLowerCase();
+        if (cat === 'washing_machine') safeGuideId = 'lg-wm-filter';
+        else if (cat === 'microwave') safeGuideId = 'samsung-mw-fuse';
+        else if (cat === 'vacuum' || titleLower.includes('пылесос')) safeGuideId = 'dyson-v11-clean';
+        else if (cat === 'furniture' && (titleLower.includes('стул') || titleLower.includes('кресл'))) {
+          safeGuideId = 'chair-upcycling';
+        }
+      }
+
+      res.json({
+        success: true,
+        source: 'gemini',
+        data: {
+          ...parsed,
+          suggestedGuideId: safeGuideId,
+          confidence:
+            typeof parsed.confidence === 'number'
+              ? Math.max(0.05, Math.min(0.99, parsed.confidence))
+              : 0.85,
+        },
+      });
+    } catch (geminiError: any) {
+      console.warn('Gemini image analysis failed:', geminiError);
+      res.status(503).json({
+        success: false,
+        source: 'unavailable',
+        error: geminiError?.message || 'Серверный Vision временно недоступен',
+      });
+    }
   } catch (error: any) {
-    res.status(500).json({ error: error.message || 'Server error' });
+    res.status(500).json({ success: false, error: error.message || 'Server error' });
   }
 });
 
@@ -482,25 +562,17 @@ app.post('/api/expert-chat', async (req: Request, res: Response) => {
 
     if (aiClient) {
       try {
-        const response = await aiClient.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents: [
-            {
-              role: 'user',
-              parts: [
-                {
-                  text: `Ты — старший мастер сервисной поддержки "МастерОК" Алексей Смирнов.
+        const replyText = await callGeminiWithFallback([
+          {
+            text: `Ты — старший мастер сервисной поддержки "МастерОК" Алексей Смирнов.
 Контекст: ${JSON.stringify(context || {})}
 Вопрос пользователя: "${message}"
 Ответь емко и профессионально на русском языке, с обязательным напоминанием о технике безопасности (отключение 220V и перекрытие воды).`,
-                },
-              ],
-            },
-          ],
-        });
+          },
+        ]);
 
         res.json({
-          reply: response.text,
+          reply: replyText,
           expert: {
             name: 'Алексей Смирнов',
             badge: 'Ведущий инженер сервиса · 14 лет опыта',

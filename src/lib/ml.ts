@@ -7,13 +7,14 @@ export interface DetectionResult {
   confidence: number;
   bbox: { x: number; y: number; width: number; height: number };
   targetMode: 'appliance' | 'upcycling' | 'fridge';
-  suggestedGuideId: string;
+  suggestedGuideId: string | null;
 }
 
 let cachedModel: ObjectDetection | null = null;
 let loadingPromise: Promise<ObjectDetection> | null = null;
 
-const ML_TIMEOUT_MS = 2200;
+const ML_LOAD_TIMEOUT_MS = 12000;
+const ML_DETECT_TIMEOUT_MS = 4000;
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -36,7 +37,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
  */
 export async function loadCocoSsd(): Promise<ObjectDetection> {
   if (cachedModel) return cachedModel;
-  if (loadingPromise) return withTimeout(loadingPromise, ML_TIMEOUT_MS, 'TF.js model');
+  if (loadingPromise) return withTimeout(loadingPromise, ML_LOAD_TIMEOUT_MS, 'TF.js model');
 
   const initPromise = (async () => {
     const tf = await import('@tensorflow/tfjs');
@@ -50,7 +51,7 @@ export async function loadCocoSsd(): Promise<ObjectDetection> {
   loadingPromise = initPromise;
 
   try {
-    return await withTimeout(initPromise, ML_TIMEOUT_MS, 'TF.js model');
+    return await withTimeout(initPromise, ML_LOAD_TIMEOUT_MS, 'TF.js model');
   } catch (err) {
     loadingPromise = null;
     throw err;
@@ -58,8 +59,15 @@ export async function loadCocoSsd(): Promise<ObjectDetection> {
 }
 
 /**
+ * Фоновый прогрев модели COCO-SSD при открытии экрана сканирования
+ */
+export function warmCocoSsd(): void {
+  if (cachedModel || loadingPromise) return;
+  loadCocoSsd().catch(() => {});
+}
+
+/**
  * Выполнение on-device распознавания на базе TensorFlow.js.
- * При превышении лимита времени или отсутствии сети быстро уступает место серверному анализу.
  */
 export async function detectObjectOnDevice(imageData: string): Promise<{
   results: DetectionResult[];
@@ -77,33 +85,15 @@ export async function detectObjectOnDevice(imageData: string): Promise<{
         img.onload = () => resolve();
         img.onerror = () => reject(new Error('Не удалось загрузить изображение для анализа'));
       }),
-      ML_TIMEOUT_MS,
+      ML_DETECT_TIMEOUT_MS,
       'Image decode'
     );
 
     const model = await loadCocoSsd();
-    const predictions = await withTimeout(model.detect(img), ML_TIMEOUT_MS, 'TF.js detect');
-
-    const relevantLabels = new Set([
-      'refrigerator',
-      'microwave',
-      'oven',
-      'toaster',
-      'sink',
-      'chair',
-      'couch',
-      'dining table',
-      'tv',
-      'laptop',
-      'bottle',
-      'bowl',
-      'apple',
-      'orange',
-      'banana',
-    ]);
+    const predictions = await withTimeout(model.detect(img), ML_DETECT_TIMEOUT_MS, 'TF.js detect');
 
     const results: DetectionResult[] = predictions
-      .filter((p) => relevantLabels.has(p.class) || p.score >= 0.55)
+      .filter((p) => p.score >= 0.42)
       .map((p) => {
         const mapped = mapCocoClassToTarget(p.class);
         return {
@@ -120,7 +110,13 @@ export async function detectObjectOnDevice(imageData: string): Promise<{
           suggestedGuideId: mapped.suggestedGuideId,
         };
       })
-      .sort((a, b) => b.confidence - a.confidence);
+      // Если в кадре человек держит предмет, отдаём приоритет самому предмету
+      .sort((a, b) => {
+        const aIsPerson = a.label.toLowerCase() === 'person' ? 1 : 0;
+        const bIsPerson = b.label.toLowerCase() === 'person' ? 1 : 0;
+        if (aIsPerson !== bIsPerson) return aIsPerson - bIsPerson;
+        return b.confidence - a.confidence;
+      });
 
     return {
       results,

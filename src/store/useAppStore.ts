@@ -9,7 +9,7 @@ export interface ScanHistoryItem {
   model?: string;
   confidence: number;
   mode: 'appliance' | 'upcycling' | 'fridge';
-  guideId: string;
+  guideId?: string | null;
   timestamp: string;
   imagePreview?: string;
 }

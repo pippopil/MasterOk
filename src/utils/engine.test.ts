@@ -45,9 +45,19 @@ test('mapCocoClassToTarget maps COCO-SSD detections cleanly', () => {
 
   const chair = mapCocoClassToTarget('chair');
   assert.equal(chair.targetMode, 'upcycling');
+  assert.equal(chair.suggestedGuideId, 'chair-upcycling');
 
   const fridge = mapCocoClassToTarget('refrigerator');
   assert.equal(fridge.targetMode, 'fridge');
+  assert.equal(fridge.suggestedGuideId, null);
+
+  const laptop = mapCocoClassToTarget('laptop');
+  assert.equal(laptop.labelRu, 'Ноутбук');
+  assert.equal(laptop.suggestedGuideId, null);
+
+  const unknown = mapCocoClassToTarget('kettle');
+  assert.equal(unknown.suggestedGuideId, null);
+  assert.ok(!unknown.labelRu.includes('Стиральная'));
 });
 
 test('buildCumulativeSavingsSeries computes running totals for Recharts', () => {

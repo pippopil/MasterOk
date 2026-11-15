@@ -1,7 +1,7 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Camera } from './Camera';
 import { SafeImage } from './SafeImage';
-import { detectObjectOnDevice, DetectionResult } from '../lib/ml';
+import { detectObjectOnDevice, DetectionResult, warmCocoSsd } from '../lib/ml';
 import { APP_IMAGES, POPULAR_GUIDES } from '../data/mockData';
 import { useAppStore } from '../store/useAppStore';
 import {
@@ -13,24 +13,33 @@ import {
   ArrowRight,
   RotateCcw,
   CheckCircle2,
+  MapPin,
 } from 'lucide-react';
+
+const API_BASE = ((import.meta as any).env?.VITE_API_BASE_URL || '').replace(/\/+$/, '');
+const VALID_GUIDE_IDS = new Set(POPULAR_GUIDES.map((g) => g.id));
 
 interface ScanOutcome {
   label: string;
-  brand?: string;
-  model?: string;
-  year?: number;
+  brand?: string | null;
+  model?: string | null;
+  year?: number | null;
   confidence: number;
   mode: 'appliance' | 'upcycling' | 'fridge';
-  guideId: string;
+  guideId: string | null;
   detectedIssues?: string[];
+  detectedIngredients?: string[];
   estimatedMasterCost?: number;
   inferenceMs: number;
   detections: DetectionResult[];
   source: string;
+  unrecognized?: boolean;
 }
 
 export const ObjectDetector: React.FC = () => {
+  useEffect(() => {
+    warmCocoSsd();
+  }, []);
   const navigate = useAppStore((s) => s.navigate);
   const addScanRecord = useAppStore((s) => s.addScanRecord);
 
@@ -97,42 +106,114 @@ export const ObjectDetector: React.FC = () => {
     const startedAt = performance.now();
 
     try {
-      // 1. Параллельный запуск локального инференса TensorFlow.js (с таймаутом) и серверного анализа
-      const serverFetchPromise = fetch('/api/analyze-image', {
+      // Быстрый путь для демонстрационных карточек-пресетов
+      if (presetHint) {
+        const finalOutcome: ScanOutcome = {
+          label: presetHint.title,
+          brand: presetHint.brand,
+          model: presetHint.model,
+          year: 2021,
+          confidence: 0.94,
+          mode: activeMode,
+          guideId: activeMode === 'fridge' ? null : presetHint.guideId,
+          detectedIssues:
+            activeMode === 'appliance'
+              ? [
+                  'Проверка основного рабочего узла и контактов',
+                  'Профилактическая очистка фильтров и корпуса',
+                ]
+              : undefined,
+          estimatedMasterCost: 3200,
+          inferenceMs: Math.round(performance.now() - startedAt),
+          detections: [],
+          source: 'Демонстрационный образец',
+        };
+        setOutcome(finalOutcome);
+        addScanRecord({
+          label: finalOutcome.label,
+          brand: finalOutcome.brand || undefined,
+          model: finalOutcome.model || undefined,
+          confidence: finalOutcome.confidence,
+          mode: activeMode,
+          guideId: finalOutcome.guideId,
+        });
+        return;
+      }
+
+      // Параллельный запуск локального TensorFlow.js COCO-SSD и серверного Vision (Gemini)
+      const localMlPromise = detectObjectOnDevice(imageData);
+      const serverFetchPromise = fetch(`${API_BASE}/api/analyze-image`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ image: imageData, mode: activeMode }),
-      }).then((r) => r.json());
+      })
+        .then(async (r) => {
+          const body = await r.json().catch(() => null);
+          return { ok: r.ok, body };
+        })
+        .catch(() => ({ ok: false, body: null }));
 
-      const localMlPromise = presetHint
-        ? Promise.resolve({ results: [] as DetectionResult[], inferenceMs: 0 })
-        : detectObjectOnDevice(imageData);
+      const serverRes = await serverFetchPromise;
+      const json = serverRes.body;
+      const hasRealGemini =
+        serverRes.ok && json?.success === true && json?.source === 'gemini' && json?.data;
+      const serverData = hasRealGemini ? json.data : null;
 
-      const [localMl, json] = await Promise.all([localMlPromise, serverFetchPromise]);
+      // Если серверный Gemini Vision уже дал точный ответ, даём локальному TF.js до 600 мс на дообогащение;
+      // при офлайне или недоступности сервера ждём полный результат COCO-SSD.
+      const localMl = hasRealGemini
+        ? await Promise.race([
+            localMlPromise,
+            new Promise<{ results: DetectionResult[]; inferenceMs: number }>((resolve) =>
+              setTimeout(() => resolve({ results: [], inferenceMs: 0 }), 600)
+            ),
+          ])
+        : await localMlPromise;
       const topLocal = localMl.results[0];
-      const serverData = json?.data || {};
-
-      const confidence =
-        presetHint
-          ? 0.94
-          : topLocal
-          ? Math.max(topLocal.confidence, Number(serverData.confidence) || 0.78)
-          : Number(serverData.confidence) || 0.65;
-
-      const label =
-        presetHint?.title ||
-        serverData.title ||
-        serverData.itemType ||
-        topLocal?.labelRu ||
-        (activeMode === 'fridge' ? 'Продукты в холодильнике' : 'Бытовая техника');
-
-      const guideId =
-        presetHint?.guideId ||
-        serverData.suggestedGuideId ||
-        topLocal?.suggestedGuideId ||
-        'lg-wm-filter';
 
       const totalMs = Math.round(performance.now() - startedAt);
+
+      if (!serverData && !topLocal) {
+        setLowConfidenceWarning(true);
+        setOutcome({
+          label: 'Объект не распознан автоматически',
+          confidence: 0,
+          mode: activeMode,
+          guideId: null,
+          inferenceMs: totalMs,
+          detections: [],
+          source: json?.error || 'Попробуйте сделать более чёткое фото при хорошем освещении',
+          unrecognized: true,
+        });
+        return;
+      }
+
+      const rawServerTitle = serverData?.title || serverData?.itemType || null;
+      const label = rawServerTitle || topLocal?.labelRu || 'Распознанный объект';
+
+      const confidence = serverData
+        ? Math.max(
+            Number(serverData.confidence) || 0.8,
+            topLocal ? topLocal.confidence : 0
+          )
+        : topLocal?.confidence || 0.55;
+
+      const rawGuideId =
+        serverData?.suggestedGuideId ?? topLocal?.suggestedGuideId ?? null;
+      const guideId =
+        typeof rawGuideId === 'string' && VALID_GUIDE_IDS.has(rawGuideId)
+          ? rawGuideId
+          : null;
+
+      const detectedCategory = String(serverData?.category || '').toLowerCase();
+      const inferredMode: 'appliance' | 'upcycling' | 'fridge' =
+        detectedCategory === 'food' || detectedCategory === 'refrigerator'
+          ? 'fridge'
+          : detectedCategory === 'furniture'
+          ? 'upcycling'
+          : serverData
+          ? activeMode
+          : topLocal?.targetMode || activeMode;
 
       if (confidence < 0.7) {
         setLowConfidenceWarning(true);
@@ -140,55 +221,61 @@ export const ObjectDetector: React.FC = () => {
 
       const finalOutcome: ScanOutcome = {
         label,
-        brand: presetHint?.brand || serverData.brand,
-        model: presetHint?.model || serverData.model,
-        year: serverData.year || 2021,
+        brand: serverData?.brand || null,
+        model: serverData?.model || null,
+        year: serverData?.year || null,
         confidence,
-        mode: activeMode,
+        mode: inferredMode,
         guideId,
-        detectedIssues: serverData.detectedIssues || [
-          'Проверка основного узла и креплений',
-          'Профилактическая очистка элементов',
-        ],
-        estimatedMasterCost: serverData.estimatedMasterCost || 3200,
+        detectedIssues: Array.isArray(serverData?.detectedIssues)
+          ? serverData.detectedIssues
+          : undefined,
+        detectedIngredients: Array.isArray(serverData?.detectedIngredients)
+          ? serverData.detectedIngredients
+          : undefined,
+        estimatedMasterCost: serverData?.estimatedMasterCost,
         inferenceMs: totalMs,
         detections: localMl.results,
-        source: topLocal ? 'TensorFlow.js + Server Vision' : 'Server Vision',
+        source: serverData
+          ? topLocal
+            ? 'Gemini Vision + TensorFlow.js'
+            : 'Gemini Vision'
+          : 'TensorFlow.js COCO-SSD (локально)',
       };
 
       setOutcome(finalOutcome);
 
-      // Сохранить в историю сканирований (Zustand) и отправить на /api/objects
       addScanRecord({
         label: finalOutcome.label,
-        brand: finalOutcome.brand,
-        model: finalOutcome.model,
+        brand: finalOutcome.brand || undefined,
+        model: finalOutcome.model || undefined,
         confidence: finalOutcome.confidence,
-        mode: activeMode,
+        mode: finalOutcome.mode,
         guideId: finalOutcome.guideId,
       });
 
-      fetch('/api/objects', {
+      fetch(`${API_BASE}/api/objects`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           type: finalOutcome.label,
-          brand: finalOutcome.brand,
-          model: finalOutcome.model,
-          year: finalOutcome.year,
+          brand: finalOutcome.brand || undefined,
+          model: finalOutcome.model || undefined,
+          year: finalOutcome.year || undefined,
           confidence: finalOutcome.confidence,
         }),
       }).catch(() => {});
     } catch {
       setLowConfidenceWarning(true);
       setOutcome({
-        label: presetHint?.title || 'Объект распознан (ручное подтверждение)',
-        confidence: 0.68,
+        label: 'Не удалось завершить распознавание',
+        confidence: 0,
         mode: activeMode,
-        guideId: presetHint?.guideId || 'lg-wm-filter',
+        guideId: null,
         inferenceMs: Math.round(performance.now() - startedAt),
         detections: [],
-        source: 'Офлайн-режим',
+        source: 'Ошибка анализа — выберите модель вручную ниже',
+        unrecognized: true,
       });
     } finally {
       setIsAnalyzing(false);
@@ -318,12 +405,21 @@ export const ObjectDetector: React.FC = () => {
 
               <div className="space-y-1.5">
                 <div className="flex items-center justify-between gap-2 text-xs text-slate-400">
-                  <span className="flex items-center gap-1.5 text-emerald-400 font-medium">
-                    <CheckCircle2 className="w-4 h-4" />
-                    Объект распознан
+                  <span
+                    className={`flex items-center gap-1.5 font-medium ${
+                      outcome.unrecognized ? 'text-amber-400' : 'text-emerald-400'
+                    }`}
+                  >
+                    {outcome.unrecognized ? (
+                      <AlertTriangle className="w-4 h-4" />
+                    ) : (
+                      <CheckCircle2 className="w-4 h-4" />
+                    )}
+                    {outcome.unrecognized ? 'Требуется уточнение' : 'Объект распознан'}
                   </span>
                   <span className="font-mono tabular-nums text-slate-300">
-                    {Math.round(outcome.confidence * 100)}% · {outcome.inferenceMs} мс
+                    {outcome.confidence > 0 ? `${Math.round(outcome.confidence * 100)}% · ` : ''}
+                    {outcome.inferenceMs} мс
                   </span>
                 </div>
                 <h2 className="text-xl font-bold text-white">{outcome.label}</h2>
@@ -332,39 +428,99 @@ export const ObjectDetector: React.FC = () => {
                   {outcome.brand ? ` · ${outcome.brand}` : ''}
                   {outcome.model ? ` ${outcome.model}` : ''}
                 </p>
+                {outcome.detections.length > 0 && (
+                  <p className="text-[11px] text-slate-400">
+                    TF.js объекты в кадре:{' '}
+                    {outcome.detections
+                      .slice(0, 3)
+                      .map((d) => `${d.labelRu} (${Math.round(d.confidence * 100)}%)`)
+                      .join(', ')}
+                  </p>
+                )}
               </div>
 
-              {outcome.detectedIssues && outcome.mode === 'appliance' && (
+              {outcome.detectedIngredients && outcome.detectedIngredients.length > 0 && (
                 <div className="space-y-2 border-t border-slate-800 pt-4">
                   <div className="text-xs font-semibold text-slate-300">
-                    Вероятные неисправности
+                    Найденные продукты
+                  </div>
+                  <p className="text-xs text-emerald-300 leading-relaxed">
+                    {outcome.detectedIngredients.join(' · ')}
+                  </p>
+                </div>
+              )}
+
+              {outcome.detectedIssues && outcome.detectedIssues.length > 0 && (
+                <div className="space-y-2 border-t border-slate-800 pt-4">
+                  <div className="text-xs font-semibold text-slate-300">
+                    Возможные неисправности и проверки
                   </div>
                   <ul className="space-y-1.5 text-xs text-slate-300">
                     {outcome.detectedIssues.map((issue, idx) => (
-                      <li key={idx} className="flex items-center justify-between py-1 border-b border-slate-800/60 last:border-b-0">
+                      <li key={idx} className="flex items-center justify-between gap-2 py-1 border-b border-slate-800/60 last:border-b-0">
                         <span>{issue}</span>
-                        <span className="text-emerald-400 font-mono tabular-nums">
-                          ~{outcome.estimatedMasterCost} ₽ экономии
-                        </span>
+                        {outcome.estimatedMasterCost ? (
+                          <span className="text-emerald-400 font-mono tabular-nums shrink-0">
+                            ~{outcome.estimatedMasterCost} ₽
+                          </span>
+                        ) : null}
                       </li>
                     ))}
                   </ul>
                 </div>
               )}
 
-              {/* Action choices: Repair / Upcycling / Fridge */}
+              {/* Action choices: matching 3D AR guide or contextual mode routing */}
               <div className="space-y-2.5 pt-2">
-                <button
-                  type="button"
-                  onClick={() => navigate(`/repair/${outcome.guideId}`)}
-                  className="w-full min-h-[48px] px-4 py-3 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-sm flex items-center justify-between transition-colors"
-                >
-                  <span className="flex items-center gap-2">
-                    <Wrench className="w-4 h-4" />
-                    <span>Открыть AR-инструкцию по ремонту</span>
-                  </span>
-                  <ArrowRight className="w-4 h-4" />
-                </button>
+                {outcome.guideId ? (
+                  <button
+                    type="button"
+                    onClick={() => navigate(`/repair/${outcome.guideId}`)}
+                    className="w-full min-h-[48px] px-4 py-3 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-sm flex items-center justify-between transition-colors"
+                  >
+                    <span className="flex items-center gap-2">
+                      <Wrench className="w-4 h-4" />
+                      <span>Открыть AR-инструкцию по ремонту</span>
+                    </span>
+                    <ArrowRight className="w-4 h-4" />
+                  </button>
+                ) : outcome.mode === 'fridge' ? (
+                  <button
+                    type="button"
+                    onClick={() => navigate('/recipes')}
+                    className="w-full min-h-[48px] px-4 py-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm flex items-center justify-between transition-colors"
+                  >
+                    <span className="flex items-center gap-2">
+                      <ChefHat className="w-4 h-4" />
+                      <span>Подобрать рецепты по фото</span>
+                    </span>
+                    <ArrowRight className="w-4 h-4" />
+                  </button>
+                ) : outcome.mode === 'upcycling' ? (
+                  <button
+                    type="button"
+                    onClick={() => navigate('/upcycle')}
+                    className="w-full min-h-[48px] px-4 py-3 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-sm flex items-center justify-between transition-colors"
+                  >
+                    <span className="flex items-center gap-2">
+                      <Leaf className="w-4 h-4" />
+                      <span>Идеи апсайклинга для объекта</span>
+                    </span>
+                    <ArrowRight className="w-4 h-4" />
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => navigate('/masters')}
+                    className="w-full min-h-[48px] px-4 py-3 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-sm flex items-center justify-between transition-colors"
+                  >
+                    <span className="flex items-center gap-2">
+                      <MapPin className="w-4 h-4" />
+                      <span>Консультация инженера по этому объекту</span>
+                    </span>
+                    <ArrowRight className="w-4 h-4" />
+                  </button>
+                )}
 
                 <div className="grid grid-cols-2 gap-2.5">
                   <button
