@@ -4,6 +4,13 @@ import { ARStep, RepairGuide } from '../data/mockData';
 import { buildCompositeModel, detectARSupport, disposeThreeObject } from '../lib/ar';
 import { useVoiceControl } from '../hooks/useVoiceControl';
 import {
+  compute3DDistanceMm,
+  formatRulerLength,
+  getModelMetersPerUnit,
+  Point3D,
+  projectScreenPointToDepthPlane,
+} from '../utils/engine';
+import {
   Camera,
   RotateCw,
   RotateCcw,
@@ -20,7 +27,31 @@ import {
   Headphones,
   ExternalLink,
   ShieldCheck,
+  Ruler,
+  Trash2,
+  Eye,
+  EyeOff,
 } from 'lucide-react';
+
+interface RulerPoint {
+  normX: number;
+  normY: number;
+  world3D: Point3D;
+  depthMeters: number;
+  depthSource: '3d-raycast' | 'camera-plane' | 'webxr-depth';
+}
+
+interface RulerMeasurement {
+  id: string;
+  p1: RulerPoint;
+  p2: RulerPoint;
+  distanceMm: number;
+  dxMm: number;
+  dyMm: number;
+  dzMm: number;
+  avgDepthMeters: number;
+  depthSource: '3d-raycast' | 'camera-plane' | 'webxr-depth';
+}
 
 interface ARViewerProps {
   guide: RepairGuide;
@@ -49,6 +80,7 @@ export const ARViewer: React.FC<ARViewerProps> = ({
 
   const mountRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const viewportRef = useRef<HTMLDivElement>(null);
 
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
@@ -58,15 +90,28 @@ export const ARViewer: React.FC<ARViewerProps> = ({
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [speechAvailable, setSpeechAvailable] = useState(false);
 
+  // AR-линейка (измерение габаритов деталей и расстояний между отверстиями по глубине сцены)
+  const [isRulerActive, setIsRulerActive] = useState(false);
+  const [rulerUnit, setRulerUnit] = useState<'mm' | 'cm'>('mm');
+  const [cameraDepthMeters, setCameraDepthMeters] = useState(0.65);
+  const [hide3DInCameraRuler, setHide3DInCameraRuler] = useState(false);
+  const [depthSensingSupported, setDepthSensingSupported] = useState(false);
+  const [rulerDraftPoint, setRulerDraftPoint] = useState<RulerPoint | null>(null);
+  const [hoverNormPos, setHoverNormPos] = useState<{ normX: number; normY: number } | null>(null);
+  const [measurements, setMeasurements] = useState<RulerMeasurement[]>([]);
+
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const modelGroupRef = useRef<THREE.Group | null>(null);
+  const gridRef = useRef<THREE.GridHelper | null>(null);
+  const rulerGroupRef = useRef<THREE.Group | null>(null);
   const partsRef = useRef<Record<string, THREE.Object3D>>({});
   const pinRef = useRef<THREE.Group | null>(null);
   const arrowRef = useRef<THREE.Group | null>(null);
   const arrowDirectionRef = useRef(step.arrowDirection);
   const highlightRef = useRef(step.highlightCoordinates);
   const stepRef = useRef(step);
+  const pointerDownPosRef = useRef<{ x: number; y: number } | null>(null);
 
   const applyStepToScene = (targetStep: ARStep) => {
     const coords = targetStep.highlightCoordinates;
@@ -187,6 +232,7 @@ export const ARViewer: React.FC<ARViewerProps> = ({
     (async () => {
       const support = await detectARSupport();
       if (cancelled || !container) return;
+      setDepthSensingSupported(support.depthSensingSupported);
 
       if (!support.webglAvailable) {
         setIs2DFallback(true);
@@ -248,11 +294,16 @@ export const ARViewer: React.FC<ARViewerProps> = ({
       const grid = new THREE.GridHelper(3.4, 12, 0x1e293b, 0x0f172a);
       grid.position.y = -1.05;
       scene.add(grid);
+      gridRef.current = grid;
 
       const { group, parts } = buildCompositeModel(guide.modelType);
       scene.add(group);
       modelGroupRef.current = group;
       partsRef.current = parts;
+
+      const rulerGroup = new THREE.Group();
+      group.add(rulerGroup);
+      rulerGroupRef.current = rulerGroup;
 
       // 3D Маркер-аннотация
       const pinGroup = new THREE.Group();
@@ -409,6 +460,205 @@ export const ARViewer: React.FC<ARViewerProps> = ({
     applyStepToScene(step);
   }, [step]);
 
+  // Скрытие 3D-макета при измерении реальных деталей через живую камеру
+  useEffect(() => {
+    const hide3D = isCameraActive && isRulerActive && hide3DInCameraRuler;
+    if (modelGroupRef.current) modelGroupRef.current.visible = !hide3D;
+    if (pinRef.current) pinRef.current.visible = !hide3D;
+    if (arrowRef.current) arrowRef.current.visible = !hide3D && Boolean(step.arrowDirection);
+    if (gridRef.current) gridRef.current.visible = !hide3D;
+  }, [isCameraActive, isRulerActive, hide3DInCameraRuler, step.arrowDirection]);
+
+  // Синхронизация 3D-маркеров и лазерной линии AR-линейки в сцене Three.js
+  useEffect(() => {
+    const rulerGroup = rulerGroupRef.current;
+    const modelGroup = modelGroupRef.current;
+    if (!rulerGroup || !modelGroup) return;
+
+    while (rulerGroup.children.length > 0) {
+      const child = rulerGroup.children[0];
+      rulerGroup.remove(child);
+      disposeThreeObject(child);
+    }
+
+    if (!isRulerActive) return;
+
+    const addPinMesh = (worldPt: Point3D, colorHex: number) => {
+      const localPt = modelGroup.worldToLocal(new THREE.Vector3(worldPt.x, worldPt.y, worldPt.z));
+      const sphere = new THREE.Mesh(
+        new THREE.SphereGeometry(0.032, 16, 16),
+        new THREE.MeshStandardMaterial({
+          color: colorHex,
+          emissive: colorHex,
+          emissiveIntensity: 0.7,
+          roughness: 0.2,
+        })
+      );
+      sphere.position.copy(localPt);
+      rulerGroup.add(sphere);
+      return localPt;
+    };
+
+    if (rulerDraftPoint && rulerDraftPoint.depthSource === '3d-raycast') {
+      addPinMesh(rulerDraftPoint.world3D, 0xf59e0b);
+    }
+
+    measurements.forEach((m) => {
+      if (m.p1.depthSource === '3d-raycast' && m.p2.depthSource === '3d-raycast') {
+        const l1 = addPinMesh(m.p1.world3D, 0x06b6d4);
+        const l2 = addPinMesh(m.p2.world3D, 0x10b981);
+        const lineGeo = new THREE.BufferGeometry().setFromPoints([l1, l2]);
+        const lineMat = new THREE.LineBasicMaterial({ color: 0x22d3ee });
+        rulerGroup.add(new THREE.Line(lineGeo, lineMat));
+      }
+    });
+  }, [isRulerActive, rulerDraftPoint, measurements]);
+
+  // Замер точки по глубине 3D-сцены (Raycaster) или плоскости глубины камеры
+  const sampleRulerPoint = (clientX: number, clientY: number): RulerPoint | null => {
+    const viewport = viewportRef.current;
+    if (!viewport) return null;
+    const rect = viewport.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+
+    const normX = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    const normY = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
+    const metersPerUnit = getModelMetersPerUnit(guide.modelType);
+    const hide3D = isCameraActive && hide3DInCameraRuler;
+
+    if (!is2DFallback && !webglLost && !hide3D && cameraRef.current && modelGroupRef.current) {
+      const raycaster = new THREE.Raycaster();
+      const ndc = new THREE.Vector2(normX * 2 - 1, -(normY * 2 - 1));
+      raycaster.setFromCamera(ndc, cameraRef.current);
+      // Исключаем собственные маркеры линейки из пересечений
+      const targetMeshes = modelGroupRef.current.children.filter(
+        (child) => child !== rulerGroupRef.current
+      );
+      const hits = raycaster.intersectObjects(targetMeshes, true);
+      if (hits.length > 0) {
+        const hit = hits[0];
+        return {
+          normX,
+          normY,
+          world3D: { x: hit.point.x, y: hit.point.y, z: hit.point.z },
+          depthMeters: Math.max(0.15, Math.round(hit.distance * metersPerUnit * 100) / 100),
+          depthSource: '3d-raycast',
+        };
+      }
+    }
+
+    const fov = cameraRef.current?.fov || 45;
+    const aspect = rect.width / rect.height;
+    const projected = projectScreenPointToDepthPlane(
+      normX,
+      normY,
+      cameraDepthMeters,
+      fov,
+      aspect
+    );
+
+    return {
+      normX,
+      normY,
+      world3D: projected,
+      depthMeters: cameraDepthMeters,
+      depthSource: depthSensingSupported && isCameraActive ? 'webxr-depth' : 'camera-plane',
+    };
+  };
+
+  const handleViewportPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!isRulerActive) return;
+    pointerDownPosRef.current = { x: e.clientX, y: e.clientY };
+  };
+
+  const handleViewportPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!isRulerActive || !rulerDraftPoint || !viewportRef.current) return;
+    const rect = viewportRef.current.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    setHoverNormPos({
+      normX: Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)),
+      normY: Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height)),
+    });
+  };
+
+  const handleViewportPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!isRulerActive || !pointerDownPosRef.current) return;
+    const moved = Math.hypot(
+      e.clientX - pointerDownPosRef.current.x,
+      e.clientY - pointerDownPosRef.current.y
+    );
+    pointerDownPosRef.current = null;
+    // Игнорируем перетаскивание орбиты 3D-модели
+    if (moved > 6) return;
+
+    const sampled = sampleRulerPoint(e.clientX, e.clientY);
+    if (!sampled) return;
+
+    if (!rulerDraftPoint) {
+      setRulerDraftPoint(sampled);
+      setHoverNormPos({ normX: sampled.normX, normY: sampled.normY });
+      return;
+    }
+
+    const viewport = viewportRef.current;
+    const fov = cameraRef.current?.fov || 45;
+    const aspect =
+      viewport && viewport.clientHeight > 0
+        ? viewport.clientWidth / viewport.clientHeight
+        : 1.5;
+
+    let metrics;
+    let combinedSource: RulerMeasurement['depthSource'] = sampled.depthSource;
+
+    if (
+      rulerDraftPoint.depthSource === '3d-raycast' &&
+      sampled.depthSource === '3d-raycast'
+    ) {
+      metrics = compute3DDistanceMm(
+        rulerDraftPoint.world3D,
+        sampled.world3D,
+        getModelMetersPerUnit(guide.modelType)
+      );
+      combinedSource = '3d-raycast';
+    } else {
+      const p1Meters = projectScreenPointToDepthPlane(
+        rulerDraftPoint.normX,
+        rulerDraftPoint.normY,
+        rulerDraftPoint.depthMeters,
+        fov,
+        aspect
+      );
+      const p2Meters = projectScreenPointToDepthPlane(
+        sampled.normX,
+        sampled.normY,
+        sampled.depthMeters,
+        fov,
+        aspect
+      );
+      metrics = compute3DDistanceMm(p1Meters, p2Meters, 1);
+      if (rulerDraftPoint.depthSource === 'camera-plane' || sampled.depthSource === 'camera-plane') {
+        combinedSource = 'camera-plane';
+      }
+    }
+
+    const newMeasurement: RulerMeasurement = {
+      id: `msr-${Date.now()}`,
+      p1: rulerDraftPoint,
+      p2: sampled,
+      distanceMm: metrics.distanceMm,
+      dxMm: metrics.dxMm,
+      dyMm: metrics.dyMm,
+      dzMm: metrics.dzMm,
+      avgDepthMeters:
+        Math.round(((rulerDraftPoint.depthMeters + sampled.depthMeters) / 2) * 100) / 100,
+      depthSource: combinedSource,
+    };
+
+    setMeasurements((prev) => [newMeasurement, ...prev].slice(0, 8));
+    setRulerDraftPoint(null);
+    setHoverNormPos(null);
+  };
+
   // Взрыв-схема (Exploded View)
   useEffect(() => {
     const parts = partsRef.current;
@@ -531,6 +781,25 @@ export const ARViewer: React.FC<ARViewerProps> = ({
 
             <button
               type="button"
+              onClick={() => {
+                setIsRulerActive((prev) => !prev);
+                setRulerDraftPoint(null);
+                setHoverNormPos(null);
+              }}
+              data-testid="ar-ruler-toggle"
+              className={`min-h-[40px] px-3 py-2 rounded-xl border text-xs font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
+                isRulerActive
+                  ? 'bg-cyan-500 text-slate-950 border-cyan-400'
+                  : 'bg-slate-800 text-slate-200 border-slate-700 hover:bg-slate-700'
+              }`}
+              aria-label="Включить AR-линейку для замера габаритов"
+            >
+              <Ruler className="w-4 h-4" />
+              <span>AR-линейка</span>
+            </button>
+
+            <button
+              type="button"
               onClick={toggleCamera}
               className={`min-h-[40px] px-3 py-2 rounded-xl border text-xs font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
                 isCameraActive
@@ -580,8 +849,15 @@ export const ARViewer: React.FC<ARViewerProps> = ({
 
         {/* Canvas or 2D Diagram Viewport */}
         <div
+          ref={viewportRef}
           data-testid="ar-viewport"
-          className="relative w-full h-[320px] sm:h-[420px] md:h-[460px] bg-slate-950 flex items-center justify-center overflow-hidden select-none"
+          onPointerDown={handleViewportPointerDown}
+          onPointerMove={handleViewportPointerMove}
+          onPointerUp={handleViewportPointerUp}
+          onPointerLeave={() => setHoverNormPos(null)}
+          className={`relative w-full h-[320px] sm:h-[420px] md:h-[460px] bg-slate-950 flex items-center justify-center overflow-hidden select-none ${
+            isRulerActive ? 'cursor-crosshair' : ''
+          }`}
         >
           {is2DFallback || webglLost ? (
             /* 2D Инструкция (Fallback при отсутствии AR/WebGL) */
@@ -649,12 +925,265 @@ export const ARViewer: React.FC<ARViewerProps> = ({
             </div>
           )}
 
-          {!is2DFallback && (
+          {isRulerActive && (
+            <svg
+              viewBox="0 0 1000 1000"
+              preserveAspectRatio="none"
+              className="absolute inset-0 w-full h-full z-10 pointer-events-none"
+            >
+              {measurements.map((m, idx) => {
+                const x1 = m.p1.normX * 1000;
+                const y1 = m.p1.normY * 1000;
+                const x2 = m.p2.normX * 1000;
+                const y2 = m.p2.normY * 1000;
+                const mx = (x1 + x2) / 2;
+                const my = (y1 + y2) / 2;
+                const isLatest = idx === 0;
+                return (
+                  <g key={m.id} opacity={isLatest ? 1 : 0.65}>
+                    <line
+                      x1={x1}
+                      y1={y1}
+                      x2={x2}
+                      y2={y2}
+                      stroke={isLatest ? '#22d3ee' : '#94a3b8'}
+                      strokeWidth={isLatest ? 4 : 2.5}
+                      strokeDasharray={m.depthSource === '3d-raycast' ? undefined : '12 8'}
+                    />
+                    <circle cx={x1} cy={y1} r={8} fill="#06b6d4" stroke="#0c0f17" strokeWidth={3} />
+                    <circle cx={x2} cy={y2} r={8} fill="#10b981" stroke="#0c0f17" strokeWidth={3} />
+                    <rect
+                      x={Math.max(20, Math.min(820, mx - 76))}
+                      y={Math.max(18, Math.min(940, my - 22))}
+                      width={152}
+                      height={36}
+                      rx={10}
+                      fill="#0c0f17"
+                      fillOpacity={0.9}
+                      stroke={isLatest ? '#22d3ee' : '#475569'}
+                      strokeWidth={2}
+                    />
+                    <text
+                      x={Math.max(96, Math.min(896, mx))}
+                      y={Math.max(41, Math.min(963, my + 2))}
+                      textAnchor="middle"
+                      fill="#f8fafc"
+                      fontSize="20"
+                      fontWeight="700"
+                      fontFamily="monospace"
+                    >
+                      {formatRulerLength(m.distanceMm, rulerUnit)}
+                    </text>
+                  </g>
+                );
+              })}
+
+              {rulerDraftPoint && (
+                <g>
+                  <circle
+                    cx={rulerDraftPoint.normX * 1000}
+                    cy={rulerDraftPoint.normY * 1000}
+                    r={11}
+                    fill="#f59e0b"
+                    stroke="#0c0f17"
+                    strokeWidth={3}
+                  />
+                  {hoverNormPos && (
+                    <line
+                      x1={rulerDraftPoint.normX * 1000}
+                      y1={rulerDraftPoint.normY * 1000}
+                      x2={hoverNormPos.normX * 1000}
+                      y2={hoverNormPos.normY * 1000}
+                      stroke="#fbbf24"
+                      strokeWidth={3}
+                      strokeDasharray="10 8"
+                    />
+                  )}
+                </g>
+              )}
+            </svg>
+          )}
+
+          {isRulerActive && (
+            <div className="absolute top-3 left-3 z-20 px-3 py-1.5 rounded-xl bg-slate-900/90 backdrop-blur-sm border border-cyan-500/40 text-xs text-slate-100 pointer-events-none">
+              {rulerDraftPoint
+                ? 'Нажмите точку 2 на детали или отверстии'
+                : 'AR-линейка: нажмите точку 1 для начала замера'}
+            </div>
+          )}
+
+          {!is2DFallback && !isRulerActive && (
             <div className="hidden sm:flex absolute bottom-4 right-4 z-10 bg-slate-900/85 backdrop-blur-sm border border-slate-800 text-[11px] text-slate-400 px-2.5 py-1.5 rounded-lg pointer-events-none">
               Вращение: мышь или свайп · Масштаб: колесо
             </div>
           )}
         </div>
+
+        {/* AR-линейка: панель глубины сцены и результатов замеров */}
+        {isRulerActive && (
+          <div
+            data-testid="ar-ruler-panel"
+            className="p-4 sm:p-5 bg-slate-950/80 border-t border-slate-800 space-y-4"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2 text-xs font-semibold text-cyan-300">
+                <Ruler className="w-4 h-4" />
+                <span>AR-линейка · Замер по глубине сцены</span>
+                {depthSensingSupported && (
+                  <span className="text-[11px] font-normal text-emerald-400">
+                    (WebXR Depth готов)
+                  </span>
+                )}
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                {isCameraActive && !is2DFallback && (
+                  <button
+                    type="button"
+                    onClick={() => setHide3DInCameraRuler((v) => !v)}
+                    className={`min-h-[34px] px-2.5 py-1 rounded-lg border text-xs font-medium flex items-center gap-1.5 transition-colors ${
+                      hide3DInCameraRuler
+                        ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300'
+                        : 'bg-slate-900 border-slate-700 text-slate-300 hover:text-white'
+                    }`}
+                  >
+                    {hide3DInCameraRuler ? (
+                      <Eye className="w-3.5 h-3.5" />
+                    ) : (
+                      <EyeOff className="w-3.5 h-3.5" />
+                    )}
+                    <span>{hide3DInCameraRuler ? 'Показать 3D-макет' : 'Только камера'}</span>
+                  </button>
+                )}
+
+                <div className="flex items-center gap-1 p-0.5 rounded-lg bg-slate-900 border border-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => setRulerUnit('mm')}
+                    className={`px-2.5 py-1 rounded-md text-xs font-semibold transition-colors ${
+                      rulerUnit === 'mm' ? 'bg-cyan-500 text-slate-950' : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    мм
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setRulerUnit('cm')}
+                    className={`px-2.5 py-1 rounded-md text-xs font-semibold transition-colors ${
+                      rulerUnit === 'cm' ? 'bg-cyan-500 text-slate-950' : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    см
+                  </button>
+                </div>
+
+                {(measurements.length > 0 || rulerDraftPoint) && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMeasurements([]);
+                      setRulerDraftPoint(null);
+                      setHoverNormPos(null);
+                    }}
+                    className="min-h-[34px] px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-xs text-slate-300 flex items-center gap-1 transition-colors"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Очистить</span>
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Калибровка плоскости глубины для замера через камеру */}
+            <div className="grid grid-cols-1 md:grid-cols-12 gap-3 items-center p-3 rounded-xl bg-slate-900 border border-slate-800">
+              <div className="md:col-span-7 space-y-1">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-slate-400">
+                    Дистанция до объекта (плоскость глубины камеры)
+                  </span>
+                  <span className="font-mono tabular-nums text-white font-semibold">
+                    {cameraDepthMeters.toFixed(2)} м
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={0.25}
+                  max={2.5}
+                  step={0.05}
+                  value={cameraDepthMeters}
+                  onChange={(e) => setCameraDepthMeters(Number(e.target.value))}
+                  aria-label="Дистанция до плоскости замера"
+                  className="w-full accent-cyan-400 cursor-pointer"
+                />
+              </div>
+
+              <div className="md:col-span-5 flex flex-wrap items-center justify-end gap-1.5">
+                {[
+                  { label: '0.4 м (близко)', val: 0.4 },
+                  { label: '0.65 м (рука)', val: 0.65 },
+                  { label: '1.2 м (корпус)', val: 1.2 },
+                ].map((preset) => (
+                  <button
+                    key={preset.val}
+                    type="button"
+                    onClick={() => setCameraDepthMeters(preset.val)}
+                    className={`px-2.5 py-1.5 rounded-lg text-[11px] font-medium border transition-colors ${
+                      Math.abs(cameraDepthMeters - preset.val) < 0.03
+                        ? 'bg-cyan-500/15 border-cyan-500/40 text-cyan-300'
+                        : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {measurements.length > 0 && (
+              <div className="divide-y divide-slate-800 rounded-xl bg-slate-900 border border-slate-800 px-3.5">
+                {measurements.map((m, idx) => (
+                  <div
+                    key={m.id}
+                    data-testid="ar-ruler-measurement-row"
+                    className="py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <span className="font-mono text-slate-500">#{measurements.length - idx}</span>
+                      <span className="font-bold font-mono tabular-nums text-white text-sm">
+                        {formatRulerLength(m.distanceMm, rulerUnit)}
+                      </span>
+                      <span className="text-slate-400 font-mono tabular-nums">
+                        (ΔX {m.dxMm} · ΔY {m.dyMm} · ΔZ {m.dzMm} мм)
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-3 text-[11px] text-slate-400">
+                      <span className="font-mono tabular-nums">
+                        Глубина: {m.avgDepthMeters.toFixed(2)} м
+                      </span>
+                      <span>
+                        {m.depthSource === '3d-raycast'
+                          ? '3D-геометрия'
+                          : m.depthSource === 'webxr-depth'
+                          ? 'WebXR Depth'
+                          : 'Глубина камеры'}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setMeasurements((prev) => prev.filter((item) => item.id !== m.id))
+                        }
+                        aria-label="Удалить замер"
+                        className="text-slate-500 hover:text-rose-400 transition-colors"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Step Details & Controls */}
         <div className="p-4 sm:p-5 bg-slate-900 border-t border-slate-800 space-y-4">

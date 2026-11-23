@@ -52,4 +52,36 @@ if (fs.existsSync(gradlePath)) {
   fs.writeFileSync(gradlePath, gradle, 'utf8');
 }
 
+// Копирование фирменных иконок приложения в ресурсы Android APK
+const resDir = path.resolve('android/app/src/main/res');
+if (fs.existsSync(resDir)) {
+  const mipmapMap = [
+    { src: 'public/icons/android-mdpi.png', dir: 'mipmap-mdpi' },
+    { src: 'public/icons/android-hdpi.png', dir: 'mipmap-hdpi' },
+    { src: 'public/icons/android-xhdpi.png', dir: 'mipmap-xhdpi' },
+    { src: 'public/icons/android-xxhdpi.png', dir: 'mipmap-xxhdpi' },
+    { src: 'public/icons/android-xxxhdpi.png', dir: 'mipmap-xxxhdpi' },
+  ];
+
+  for (const { src, dir } of mipmapMap) {
+    const srcPath = path.resolve(src);
+    const targetDir = path.join(resDir, dir);
+    if (fs.existsSync(srcPath) && fs.existsSync(targetDir)) {
+      fs.copyFileSync(srcPath, path.join(targetDir, 'ic_launcher.png'));
+      fs.copyFileSync(srcPath, path.join(targetDir, 'ic_launcher_round.png'));
+      fs.copyFileSync(srcPath, path.join(targetDir, 'ic_launcher_foreground.png'));
+    }
+  }
+
+  const valuesDir = path.join(resDir, 'values');
+  if (fs.existsSync(valuesDir)) {
+    const bgFile = path.join(valuesDir, 'ic_launcher_background.xml');
+    fs.writeFileSync(
+      bgFile,
+      '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_background">#0C0F17</color>\n</resources>\n',
+      'utf8'
+    );
+  }
+}
+
 console.log(`Configured Android build: versionCode=${buildNumber}, versionName=${versionName}`);

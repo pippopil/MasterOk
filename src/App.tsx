@@ -23,6 +23,7 @@ import { LocalMastersMap } from './components/LocalMastersMap';
 import { ProfileDashboard } from './components/ProfileDashboard';
 import { UGCBuilderModal } from './components/UGCBuilderModal';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import brandLogoImg from './assets/images/masterok_brand_logo_1795454129010.jpg';
 import {
   cacheInstructions,
   flushOfflineQueue,
@@ -141,9 +142,15 @@ export default function App() {
               e.preventDefault();
               navigate('/');
             }}
-            className="text-lg font-bold tracking-tight text-white whitespace-nowrap shrink-0 hover:text-cyan-400 transition-colors"
+            className="flex items-center gap-2.5 text-lg font-bold tracking-tight text-white whitespace-nowrap shrink-0 hover:text-cyan-400 transition-colors"
           >
-            МастерОК
+            <img
+              src={brandLogoImg}
+              alt="Логотип МастерОК"
+              referrerPolicy="no-referrer"
+              className="w-7 h-7 rounded-lg object-cover border border-slate-700/80 shrink-0"
+            />
+            <span>МастерОК</span>
           </a>
 
           {/* Zone 2: 5 concise single-line text nav links */}

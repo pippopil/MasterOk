@@ -411,3 +411,91 @@ export function applyBrightnessContrast(
     }
   }
 }
+
+export interface Point3D {
+  x: number;
+  y: number;
+  z: number;
+}
+
+/**
+ * Физический масштаб (метров в 1 единице 3D-сцены) для калибровки размеров деталей.
+ */
+export function getModelMetersPerUnit(
+  modelType: 'washing_machine' | 'microwave' | 'vacuum' | 'chair' | 'fridge'
+): number {
+  switch (modelType) {
+    case 'washing_machine':
+    case 'fridge':
+      return 0.6 / 1.56; // стандартная ширина корпуса 600 мм
+    case 'microwave':
+      return 0.49 / 1.8; // стандартная ширина 490 мм
+    case 'vacuum':
+      return 0.32 / 0.86; // высота циклонного блока 320 мм
+    case 'chair':
+      return 0.45 / 1.08; // диаметр сиденья 450 мм
+    default:
+      return 0.5;
+  }
+}
+
+/**
+ * Проецирует нормализованные экранные координаты [0..1, 0..1] на плоскость глубины depthMeters
+ * с учётом вертикального угла обзора камеры fovDeg и соотношения сторон aspectRatio.
+ */
+export function projectScreenPointToDepthPlane(
+  normX: number,
+  normY: number,
+  depthMeters: number,
+  fovDeg: number = 45,
+  aspectRatio: number = 1.5
+): Point3D {
+  const safeDepth = Math.max(0.1, depthMeters);
+  const ndcX = normX * 2 - 1;
+  const ndcY = 1 - normY * 2;
+  const halfHeight = safeDepth * Math.tan((fovDeg * Math.PI) / 360);
+  const halfWidth = halfHeight * Math.max(0.2, aspectRatio);
+
+  return {
+    x: ndcX * halfWidth,
+    y: ndcY * halfHeight,
+    z: -safeDepth,
+  };
+}
+
+/**
+ * Вычисляет 3D-расстояние между двумя точками в миллиметрах и осям ΔX/ΔY/ΔZ.
+ */
+export function compute3DDistanceMm(
+  p1: Point3D,
+  p2: Point3D,
+  metersPerUnit: number = 1
+): {
+  distanceMm: number;
+  distanceCm: number;
+  dxMm: number;
+  dyMm: number;
+  dzMm: number;
+} {
+  const dx = (p2.x - p1.x) * metersPerUnit;
+  const dy = (p2.y - p1.y) * metersPerUnit;
+  const dz = (p2.z - p1.z) * metersPerUnit;
+  const distMeters = Math.hypot(dx, dy, dz);
+  const distanceMm = Math.round(distMeters * 10000) / 10;
+
+  return {
+    distanceMm,
+    distanceCm: Math.round(distanceMm) / 10,
+    dxMm: Math.round(Math.abs(dx) * 1000),
+    dyMm: Math.round(Math.abs(dy) * 1000),
+    dzMm: Math.round(Math.abs(dz) * 1000),
+  };
+}
+
+export function formatRulerLength(distanceMm: number, unit: 'mm' | 'cm' = 'mm'): string {
+  if (unit === 'cm') {
+    return `${(distanceMm / 10).toFixed(1)} см`;
+  }
+  return `${Math.round(distanceMm)} мм`;
+}
+

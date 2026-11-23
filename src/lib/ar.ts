@@ -4,10 +4,11 @@ export interface ARSupportInfo {
   webglAvailable: boolean;
   isSoftwareGl: boolean;
   webxrSupported: boolean;
+  depthSensingSupported: boolean;
 }
 
 /**
- * Проверка поддержки WebGL / программного рендера (SwiftShader/llvmpipe) и WebXR
+ * Проверка поддержки WebGL / программного рендера (SwiftShader/llvmpipe) и WebXR / depth-sensing
  */
 export async function detectARSupport(): Promise<ARSupportInfo> {
   let webglAvailable = false;
@@ -29,6 +30,8 @@ export async function detectARSupport(): Promise<ARSupportInfo> {
   }
 
   let webxrSupported = false;
+  const depthSensingSupported =
+    typeof window !== 'undefined' && 'XRDepthInformation' in window;
   try {
     if (typeof navigator !== 'undefined' && 'xr' in navigator && (navigator as any).xr) {
       webxrSupported = await (navigator as any).xr.isSessionSupported('immersive-ar');
@@ -37,7 +40,7 @@ export async function detectARSupport(): Promise<ARSupportInfo> {
     webxrSupported = false;
   }
 
-  return { webglAvailable, isSoftwareGl, webxrSupported };
+  return { webglAvailable, isSoftwareGl, webxrSupported, depthSensingSupported };
 }
 
 /**

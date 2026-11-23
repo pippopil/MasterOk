@@ -12,6 +12,10 @@ import {
   computeCenterCropRect,
   applyBrightnessContrast,
   isLowConfidence,
+  getModelMetersPerUnit,
+  projectScreenPointToDepthPlane,
+  compute3DDistanceMm,
+  formatRulerLength,
   Recipe,
   ApplianceItem,
   LocalMaster,
@@ -233,4 +237,21 @@ test('isLowConfidence flags scores strictly below 75%', () => {
   assert.equal(isLowConfidence(0.75), false);
   assert.equal(isLowConfidence(0.94), false);
 });
+
+test('AR-ruler projects screen points to depth plane and computes 3D distance in mm', () => {
+  const scale = getModelMetersPerUnit('washing_machine');
+  // 1.56 scene units = 0.60 m = 600 mm
+  const widthDist = compute3DDistanceMm({ x: -0.78, y: 0, z: 0 }, { x: 0.78, y: 0, z: 0 }, scale);
+  assert.equal(Math.round(widthDist.distanceMm), 600);
+  assert.equal(formatRulerLength(widthDist.distanceMm, 'mm'), '600 мм');
+  assert.equal(formatRulerLength(widthDist.distanceMm, 'cm'), '60.0 см');
+
+  // Symmetrical points on depth plane at 1.0 m depth
+  const pLeft = projectScreenPointToDepthPlane(0.25, 0.5, 1.0, 60, 1.0);
+  const pRight = projectScreenPointToDepthPlane(0.75, 0.5, 1.0, 60, 1.0);
+  const planeDist = compute3DDistanceMm(pLeft, pRight, 1);
+  // tan(30 deg) ~= 0.57735 m half-width; delta x = 0.57735 m = ~577.4 mm
+  assert.ok(planeDist.distanceMm > 575 && planeDist.distanceMm < 580);
+});
+
 
