@@ -3,12 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { Suspense, useEffect, useState } from 'react';
 import {
   Wrench,
   Camera,
   Leaf,
-  ChefHat,
   MapPin,
   User,
 } from 'lucide-react';
@@ -17,13 +16,24 @@ import { POPULAR_GUIDES, RepairGuide } from './data/mockData';
 import { LocalMaster } from './utils/engine';
 import { CatalogView } from './components/CatalogView';
 import { ObjectDetector } from './components/ObjectDetector';
-import { ARViewer } from './components/ARViewer';
 import { UpcyclingLab } from './components/UpcyclingLab';
 import { FridgeChef } from './components/FridgeChef';
 import { SOSExpertChat } from './components/SOSExpertChat';
 import { LocalMastersMap } from './components/LocalMastersMap';
 import { ProfileDashboard } from './components/ProfileDashboard';
 import { UGCBuilderModal } from './components/UGCBuilderModal';
+import { ErrorBoundary } from './components/ErrorBoundary';
+import {
+  cacheInstructions,
+  flushOfflineQueue,
+  getCachedInstructions,
+} from './lib/offlineDb';
+
+const API_BASE = ((import.meta as any).env?.VITE_API_BASE_URL || '').replace(/\/+$/, '');
+
+const ARViewer = React.lazy(() =>
+  import('./components/ARViewer').then((m) => ({ default: m.ARViewer }))
+);
 
 export default function App() {
   const route = useAppStore((s) => s.route);
@@ -47,7 +57,34 @@ export default function App() {
       navigate('/scan');
     }
 
-    return () => window.removeEventListener('popstate', onPopState);
+    // Кэширование инструкций в IndexedDB и синхронизация офлайн-очереди при восстановлении сети
+    const syncOfflineAndCache = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/instructions`);
+        if (res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data?.instructions)) {
+            await cacheInstructions(data.instructions);
+          }
+        } else {
+          await getCachedInstructions();
+        }
+      } catch {
+        await getCachedInstructions();
+      }
+      await flushOfflineQueue(API_BASE);
+    };
+
+    syncOfflineAndCache();
+    const onOnline = () => {
+      flushOfflineQueue(API_BASE);
+    };
+    window.addEventListener('online', onOnline);
+
+    return () => {
+      window.removeEventListener('popstate', onPopState);
+      window.removeEventListener('online', onOnline);
+    };
   }, [syncFromLocation, navigate]);
 
   const activeGuideId =
@@ -152,58 +189,73 @@ export default function App() {
 
       {/* Main Content */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6 sm:py-8 pb-24 md:pb-12">
-        {route.page === 'home' && (
-          <CatalogView onOpenUGC={() => setUgcOpen(true)} />
-        )}
+        <ErrorBoundary onResetHome={() => navigate('/')}>
+          {route.page === 'home' && (
+            <CatalogView onOpenUGC={() => setUgcOpen(true)} />
+          )}
 
-        {route.page === 'scan' && <ObjectDetector />}
+          {route.page === 'scan' && <ObjectDetector />}
 
-        {route.page === 'repair' && (
-          <ARViewer
-            guide={currentGuide}
-            currentStepIndex={currentStepIndex}
-            onNextStep={handleNextStep}
-            onPrevStep={handlePrevStep}
-            onStepComplete={handleStepComplete}
-            completedSteps={completedSteps}
-            onAskExpert={() => navigate('/masters')}
-            onChangeDevice={() => navigate('/')}
-          />
-        )}
+          {route.page === 'repair' && (
+            <Suspense
+              fallback={
+                <div className="p-8 rounded-2xl bg-slate-900 border border-slate-800 text-center space-y-2">
+                  <div className="text-sm font-semibold text-white">
+                    Загрузка 3D/AR-сцены...
+                  </div>
+                  <div className="text-xs text-slate-400">
+                    Подготовка интерактивной модели и пошаговой инструкции
+                  </div>
+                </div>
+              }
+            >
+              <ARViewer
+                guide={currentGuide}
+                currentStepIndex={currentStepIndex}
+                onNextStep={handleNextStep}
+                onPrevStep={handlePrevStep}
+                onStepComplete={handleStepComplete}
+                completedSteps={completedSteps}
+                onAskExpert={() => navigate('/masters')}
+                onChangeDevice={() => navigate('/')}
+              />
+            </Suspense>
+          )}
 
-        {route.page === 'upcycle' && <UpcyclingLab />}
+          {route.page === 'upcycle' && <UpcyclingLab />}
 
-        {route.page === 'recipes' && <FridgeChef />}
+          {route.page === 'recipes' && <FridgeChef />}
 
-        {route.page === 'masters' && (
-          <div className="space-y-8">
-            <div className="space-y-1.5">
-              <div className="text-xs font-medium text-cyan-400">
-                Помощь специалистов · Чат и карта района
+          {route.page === 'masters' && (
+            <div className="space-y-8">
+              <div className="space-y-1.5">
+                <div className="text-xs font-medium text-cyan-400">
+                  Помощь специалистов · Чат и карта района
+                </div>
+                <h1 className="text-2xl sm:text-3xl font-bold text-white tracking-tight">
+                  Связь с экспертом и локальные мастера
+                </h1>
+                <p className="text-sm text-slate-400">
+                  Задайте вопрос дежурному инженеру или выберите мастера рядом для выезда в сложных случаях.
+                </p>
               </div>
-              <h1 className="text-2xl sm:text-3xl font-bold text-white tracking-tight">
-                Связь с экспертом и локальные мастера
-              </h1>
-              <p className="text-sm text-slate-400">
-                Задайте вопрос дежурному инженеру или выберите мастера рядом для выезда в сложных случаях.
-              </p>
+
+              <SOSExpertChat
+                currentAppliance={currentGuide.title}
+                selectedMaster={selectedMasterForChat}
+              />
+
+              <LocalMastersMap
+                onSelectMasterForChat={(master) => {
+                  setSelectedMasterForChat(master);
+                  window.scrollTo({ top: 0, behavior: 'smooth' });
+                }}
+              />
             </div>
+          )}
 
-            <SOSExpertChat
-              currentAppliance={currentGuide.title}
-              selectedMaster={selectedMasterForChat}
-            />
-
-            <LocalMastersMap
-              onSelectMasterForChat={(master) => {
-                setSelectedMasterForChat(master);
-                window.scrollTo({ top: 0, behavior: 'smooth' });
-              }}
-            />
-          </div>
-        )}
-
-        {route.page === 'profile' && <ProfileDashboard />}
+          {route.page === 'profile' && <ProfileDashboard />}
+        </ErrorBoundary>
       </main>
 
       {/* Mobile Bottom Tab Bar (56px height, total sticky chrome <= 15% of 844px mobile viewport) */}

@@ -2,12 +2,15 @@ import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { ARStep, RepairGuide } from '../data/mockData';
 import { buildCompositeModel, detectARSupport, disposeThreeObject } from '../lib/ar';
+import { useVoiceControl } from '../hooks/useVoiceControl';
 import {
   Camera,
   RotateCw,
   RotateCcw,
   Volume2,
   VolumeX,
+  Mic,
+  MicOff,
   Layers,
   ShieldAlert,
   CheckCircle2,
@@ -118,6 +121,18 @@ export const ARViewer: React.FC<ARViewerProps> = ({
     utterance.onerror = () => setIsSpeaking(false);
     window.speechSynthesis.speak(utterance);
   };
+
+  const voiceControl = useVoiceControl({
+    onNextStep,
+    onPrevStep,
+    onRepeatStep: speakCurrentStep,
+    onStopSpeaking: () => {
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+      }
+      setIsSpeaking(false);
+    },
+  });
 
   const toggleCamera = async () => {
     if (isCameraActive) {
@@ -492,6 +507,28 @@ export const ARViewer: React.FC<ARViewerProps> = ({
               </button>
             )}
 
+            {voiceControl.isSupported && (
+              <button
+                type="button"
+                onClick={voiceControl.toggleListening}
+                className={`min-h-[40px] px-3 py-2 rounded-xl border text-xs font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
+                  voiceControl.isListening
+                    ? 'bg-emerald-500 text-slate-950 border-emerald-400'
+                    : 'bg-slate-800 text-slate-200 border-slate-700 hover:bg-slate-700'
+                }`}
+                aria-label="Управление голосом (следующий шаг, повтори, стоп)"
+              >
+                {voiceControl.isListening ? (
+                  <Mic className="w-4 h-4" />
+                ) : (
+                  <MicOff className="w-4 h-4" />
+                )}
+                <span className="hidden sm:inline">
+                  {voiceControl.isListening ? 'Слушаю' : 'Команды'}
+                </span>
+              </button>
+            )}
+
             <button
               type="button"
               onClick={toggleCamera}
@@ -634,6 +671,20 @@ export const ARViewer: React.FC<ARViewerProps> = ({
           <p className="text-slate-200 text-sm sm:text-base leading-relaxed">
             {step.description}
           </p>
+
+          {(voiceControl.isListening || voiceControl.lastCommand || voiceControl.voiceError) && (
+            <div className="text-xs text-slate-400">
+              {voiceControl.voiceError ? (
+                <span className="text-amber-300">{voiceControl.voiceError}</span>
+              ) : voiceControl.isListening ? (
+                <span>
+                  Голосовое управление активно · скажите «следующий шаг», «повтори», «назад» или «стоп»
+                </span>
+              ) : (
+                <span>Последняя команда: «{voiceControl.lastCommand}»</span>
+              )}
+            </div>
+          )}
 
           <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-800 text-xs">
             {step.toolsRequired.length > 0 && (

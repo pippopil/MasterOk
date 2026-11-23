@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Camera } from './Camera';
 import { SafeImage } from './SafeImage';
 import { detectObjectOnDevice, DetectionResult, warmCocoSsd } from '../lib/ml';
+import { enqueueOfflineItem } from '../lib/offlineDb';
 import { APP_IMAGES, POPULAR_GUIDES } from '../data/mockData';
 import { useAppStore } from '../store/useAppStore';
 import {
@@ -122,6 +123,7 @@ export const ObjectDetector: React.FC = () => {
   }, []);
   const navigate = useAppStore((s) => s.navigate);
   const addScanRecord = useAppStore((s) => s.addScanRecord);
+  const setLastDetectedObject = useAppStore((s) => s.setLastDetectedObject);
 
   const [mode, setMode] = useState<'appliance' | 'upcycling' | 'fridge'>('appliance');
   const [rawCapturedImage, setRawCapturedImage] = useState<string | null>(null);
@@ -131,6 +133,7 @@ export const ObjectDetector: React.FC = () => {
   const [cameraErrorMsg, setCameraErrorMsg] = useState<string | null>(null);
   const [outcome, setOutcome] = useState<ScanOutcome | null>(null);
   const [lowConfidenceWarning, setLowConfidenceWarning] = useState(false);
+  const [pendingOfflineSync, setPendingOfflineSync] = useState(false);
 
   // Параметры предобработки кадра перед отправкой в AI-модель
   const [centerCrop, setCenterCrop] = useState(true);
@@ -193,6 +196,7 @@ export const ObjectDetector: React.FC = () => {
     setIsAnalyzing(true);
     setOutcome(null);
     setLowConfidenceWarning(false);
+    setPendingOfflineSync(false);
 
     const startedAt = performance.now();
 
@@ -233,6 +237,10 @@ export const ObjectDetector: React.FC = () => {
           preprocessingInfo,
         };
         setOutcome(finalOutcome);
+        setLastDetectedObject({
+          label: finalOutcome.label,
+          confidence: finalOutcome.confidence,
+        });
         addScanRecord({
           label: finalOutcome.label,
           brand: finalOutcome.brand || undefined,
@@ -350,6 +358,10 @@ export const ObjectDetector: React.FC = () => {
       };
 
       setOutcome(finalOutcome);
+      setLastDetectedObject({
+        label: finalOutcome.label,
+        confidence: finalOutcome.confidence,
+      });
 
       addScanRecord({
         label: finalOutcome.label,
@@ -360,17 +372,29 @@ export const ObjectDetector: React.FC = () => {
         guideId: finalOutcome.guideId,
       });
 
+      const objectPayload = {
+        type: finalOutcome.label,
+        brand: finalOutcome.brand || undefined,
+        model: finalOutcome.model || undefined,
+        year: finalOutcome.year || undefined,
+        confidence: finalOutcome.confidence,
+      };
       fetch(`${API_BASE}/api/objects`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          type: finalOutcome.label,
-          brand: finalOutcome.brand || undefined,
-          model: finalOutcome.model || undefined,
-          year: finalOutcome.year || undefined,
-          confidence: finalOutcome.confidence,
-        }),
-      }).catch(() => {});
+        body: JSON.stringify(objectPayload),
+      })
+        .then((res) => {
+          if (!res.ok) throw new Error('Sync deferred');
+        })
+        .catch(() => {
+          setPendingOfflineSync(true);
+          enqueueOfflineItem({
+            type: 'object',
+            endpoint: '/api/objects',
+            payload: objectPayload,
+          });
+        });
     } catch {
       setLowConfidenceWarning(true);
       setOutcome({
@@ -592,16 +616,48 @@ export const ObjectDetector: React.FC = () => {
               {(lowConfidenceWarning || isLowConfidence(outcome.confidence)) && (
                 <div
                   role="alert"
-                  className="p-3.5 rounded-xl bg-amber-950/50 border border-amber-500/40 text-amber-200 text-xs flex items-start gap-2.5"
+                  className="p-4 rounded-xl bg-amber-950/50 border border-amber-500/40 text-amber-200 text-xs space-y-3"
                 >
-                  <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
-                  <div className="space-y-1">
-                    <div className="font-semibold text-amber-100">
-                      Уверенность распознавания ниже 75%
+                  <div className="flex items-start gap-2.5">
+                    <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                    <div className="space-y-1">
+                      <div className="font-semibold text-amber-100">
+                        Уверенность распознавания ниже 75%
+                      </div>
+                      <div>
+                        Попробуйте сменить ракурс или улучшить освещение — это поможет снизить риск ошибки. Выберите действие ниже:
+                      </div>
                     </div>
-                    <div>
-                      Попробуйте сменить ракурс или улучшить освещение — это поможет снизить риск ошибки. Также можно скорректировать яркость/контраст или выбрать модель вручную ниже.
-                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2 pt-0.5">
+                    <button
+                      type="button"
+                      onClick={resetScanner}
+                      className="min-h-[36px] px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-semibold transition-colors"
+                    >
+                      Сделать фото с другого ракурса
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => navigate('/repair/lg-wm-filter')}
+                      className="min-h-[36px] px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-200 font-medium transition-colors"
+                    >
+                      Стиральная машина
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => navigate('/repair/samsung-mw-fuse')}
+                      className="min-h-[36px] px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-200 font-medium transition-colors"
+                    >
+                      Микроволновка
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => navigate('/')}
+                      className="min-h-[36px] px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-cyan-300 font-medium transition-colors"
+                    >
+                      Универсальный каталог
+                    </button>
                   </div>
                 </div>
               )}
@@ -659,6 +715,11 @@ export const ObjectDetector: React.FC = () => {
                 {outcome.preprocessingInfo && (
                   <p className="text-[11px] text-slate-500">
                     Предобработка: {outcome.preprocessingInfo}
+                  </p>
+                )}
+                {pendingOfflineSync && (
+                  <p className="text-[11px] text-amber-300">
+                    Результат сохранён локально — будет синхронизирован при подключении к сети.
                   </p>
                 )}
                 {outcome.detections.length > 0 && (
@@ -758,11 +819,17 @@ export const ObjectDetector: React.FC = () => {
                 <div className="grid grid-cols-2 gap-2.5">
                   <button
                     type="button"
-                    onClick={() => navigate('/upcycle')}
-                    className="min-h-[44px] px-3 py-2.5 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 text-slate-200 text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap"
+                    onClick={() => {
+                      setLastDetectedObject({
+                        label: outcome.label,
+                        confidence: outcome.confidence,
+                      });
+                      navigate('/upcycle');
+                    }}
+                    className="min-h-[44px] px-3 py-2.5 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 text-slate-200 text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors"
                   >
-                    <Leaf className="w-3.5 h-3.5 text-amber-400" />
-                    <span>5 идей апсайклинга</span>
+                    <Leaf className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                    <span>Не ремонтировать, а переделать?</span>
                   </button>
                   <button
                     type="button"

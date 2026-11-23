@@ -27,11 +27,37 @@ export const ProfileDashboard: React.FC = () => {
   const savedIdeas = useAppStore((s) => s.savedIdeas);
   const savedRecipeIds = useAppStore((s) => s.savedRecipeIds);
 
-  const [chartMetric, setChartMetric] = useState<'money' | 'eco'>('money');
+  const [chartMetric, setChartMetric] = useState<'money' | 'eco' | 'wallet'>('money');
 
   const chartSeries = useMemo(() => {
     return buildCumulativeSavingsSeries(savingsHistory);
   }, [savingsHistory]);
+
+  const ecoWalletData = useMemo(() => {
+    const upcycleProfit = savedIdeas.reduce(
+      (sum, idea) => sum + Math.max(0, idea.marketValueAfter - idea.materialsCost),
+      0
+    );
+    const upcycleMaterials = savedIdeas.reduce((sum, idea) => sum + idea.materialsCost, 0);
+    const estimatedPartsSpend = completedRepairsCount * 450;
+    const totalSaved = totalSavedRub + upcycleProfit;
+    const totalSpent = estimatedPartsSpend + upcycleMaterials;
+
+    return [
+      {
+        label: 'Сэкономлено',
+        amount: totalSaved,
+      },
+      {
+        label: 'Затраты на материалы',
+        amount: totalSpent,
+      },
+      {
+        label: 'Чистая выгода',
+        amount: Math.max(0, totalSaved - totalSpent),
+      },
+    ];
+  }, [totalSavedRub, savedIdeas, completedRepairsCount]);
 
   const savedRecipes = ZERO_WASTE_RECIPES.filter((r) => savedRecipeIds.includes(r.id));
 
@@ -107,7 +133,7 @@ export const ProfileDashboard: React.FC = () => {
             </p>
           </div>
 
-          <div className="flex items-center gap-1 p-1 bg-slate-950 border border-slate-800 rounded-xl self-start">
+          <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-950 border border-slate-800 rounded-xl self-start">
             <button
               type="button"
               onClick={() => setChartMetric('money')}
@@ -129,6 +155,17 @@ export const ProfileDashboard: React.FC = () => {
               }`}
             >
               Экология (CO₂ кг)
+            </button>
+            <button
+              type="button"
+              onClick={() => setChartMetric('wallet')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap ${
+                chartMetric === 'wallet'
+                  ? 'bg-amber-500 text-slate-950'
+                  : 'text-slate-300 hover:text-white'
+              }`}
+            >
+              Эко-кошелёк
             </button>
           </div>
         </div>
@@ -167,7 +204,7 @@ export const ProfileDashboard: React.FC = () => {
                   fill="url(#savingsFill)"
                 />
               </AreaChart>
-            ) : (
+            ) : chartMetric === 'eco' ? (
               <BarChart data={chartSeries} margin={{ top: 10, right: 16, left: 0, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
                 <XAxis dataKey="month" stroke="#94a3b8" fontSize={12} tickLine={false} />
@@ -186,6 +223,26 @@ export const ProfileDashboard: React.FC = () => {
                   ]}
                 />
                 <Bar dataKey="cumulativeCo2Kg" fill="#06b6d4" radius={[6, 6, 0, 0]} />
+              </BarChart>
+            ) : (
+              <BarChart data={ecoWalletData} margin={{ top: 10, right: 16, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
+                <XAxis dataKey="label" stroke="#94a3b8" fontSize={12} tickLine={false} />
+                <YAxis stroke="#94a3b8" fontSize={12} tickLine={false} />
+                <Tooltip
+                  contentStyle={{
+                    backgroundColor: '#0f172a',
+                    borderColor: '#334155',
+                    borderRadius: '12px',
+                    fontSize: '12px',
+                    color: '#f8fafc',
+                  }}
+                  formatter={(value: any) => [
+                    `${Number(value).toLocaleString('ru-RU')} ₽`,
+                    'Сумма',
+                  ]}
+                />
+                <Bar dataKey="amount" fill="#f59e0b" radius={[6, 6, 0, 0]} />
               </BarChart>
             )}
           </ResponsiveContainer>

@@ -53,6 +53,10 @@ interface AppStoreState {
   savedRecipeIds: string[];
   toggleSaveRecipe: (recipeId: string) => void;
 
+  // Последний распознанный объект для кросс-модульного перехода (Сканер -> Апсайклинг)
+  lastDetectedObject: { label: string; confidence: number } | null;
+  setLastDetectedObject: (obj: { label: string; confidence: number } | null) => void;
+
   // UGC инструкции
   customGuides: CustomUGCGuide[];
   addCustomGuide: (guide: CustomUGCGuide) => void;
@@ -193,6 +197,9 @@ export const useAppStore = create<AppStoreState>((set, get) => ({
           : [recipeId, ...state.savedRecipeIds],
       };
     }),
+
+  lastDetectedObject: null,
+  setLastDetectedObject: (obj) => set({ lastDetectedObject: obj }),
 
   customGuides: [],
   addCustomGuide: (guide) =>

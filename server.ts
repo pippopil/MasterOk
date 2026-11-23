@@ -1,8 +1,22 @@
 import express, { Request, Response } from 'express';
+import rateLimit from 'express-rate-limit';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
+import {
+  analyzeImageSchema,
+  createObjectSchema,
+  expertChatSchema,
+  recipesSchema,
+  upcycleIdeasSchema,
+  upcycleSuggestSchema,
+} from './src/server/schemas';
+import {
+  generateContentWithFallback,
+  parseCleanJson,
+  parseImageDataUrl,
+} from './src/server/services/gemini.service';
 
 dotenv.config();
 
@@ -13,6 +27,14 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json({ limit: '20mb' }));
+
+const aiLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 15,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Слишком много запросов к ИИ, повторите попытку через минуту.' },
+});
 
 // Инициализация Gemini API (строго на стороне сервера)
 const apiKey = process.env.GEMINI_API_KEY;
@@ -38,65 +60,6 @@ const VALID_GUIDE_IDS = new Set([
   'dyson-v11-clean',
   'chair-upcycling',
 ]);
-
-function parseImageDataUrl(dataUrl: string): { mimeType: string; data: string } | null {
-  const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
-  if (!match) return null;
-  return { mimeType: match[1], data: match[2] };
-}
-
-async function generateContentWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`Gemini timeout after ${timeoutMs}ms`)), timeoutMs);
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (err) => {
-        clearTimeout(timer);
-        reject(err);
-      }
-    );
-  });
-}
-
-async function callGeminiWithFallback(
-  parts: any[],
-  options?: { responseMimeType?: string }
-): Promise<string> {
-  if (!aiClient) {
-    throw new Error('GEMINI_API_KEY is not configured');
-  }
-  const attempts: { model: string; timeoutMs: number }[] = [
-    { model: 'gemini-4-hydrogen', timeoutMs: 5500 },
-    { model: 'gemini-3.1-flash-lite', timeoutMs: 12000 },
-  ];
-  let lastError: unknown = null;
-
-  for (const { model, timeoutMs } of attempts) {
-    try {
-      const response = await generateContentWithTimeout(
-        aiClient.models.generateContent({
-          model,
-          contents: [{ role: 'user', parts }],
-          ...(options?.responseMimeType
-            ? { config: { responseMimeType: options.responseMimeType } }
-            : {}),
-        }),
-        timeoutMs
-      );
-      if (response.text) {
-        return response.text;
-      }
-    } catch (err) {
-      lastError = err;
-      console.warn(`Gemini model ${model} failed:`, err instanceof Error ? err.message : err);
-    }
-  }
-
-  throw lastError instanceof Error ? lastError : new Error('All Gemini models failed');
-}
 
 interface StoredObjectRecord {
   id: string;
@@ -126,18 +89,21 @@ app.get('/api/objects', (_req: Request, res: Response) => {
 });
 
 app.post('/api/objects', (req: Request, res: Response) => {
-  const { type, brand, model, year, confidence } = req.body || {};
-  if (!type) {
-    res.status(400).json({ error: 'Object type is required' });
+  const validation = createObjectSchema.safeParse(req.body);
+  if (!validation.success) {
+    res.status(400).json({
+      error: validation.error.issues[0]?.message || 'Некорректные данные объекта',
+    });
     return;
   }
+  const { type, brand, model, year, confidence } = validation.data;
   const created: StoredObjectRecord = {
     id: `obj-${Date.now()}`,
-    type: String(type),
-    brand: brand ? String(brand) : undefined,
-    model: model ? String(model) : undefined,
-    year: year ? Number(year) : undefined,
-    confidence: Number(confidence) || 0.85,
+    type,
+    brand,
+    model,
+    year,
+    confidence: confidence ?? 0.85,
     createdAt: new Date().toISOString(),
   };
   scannedObjectsDb.unshift(created);
@@ -156,10 +122,94 @@ app.get('/api/instructions', (_req: Request, res: Response) => {
   });
 });
 
-// API: Генерация 5 идей апсайклинга (/api/upcycle-ideas)
-app.post('/api/upcycle-ideas', async (req: Request, res: Response) => {
+// API: Быстрый подбор 3 идей апсайклинга для распознанного объекта (/api/upcycle/suggest)
+app.post('/api/upcycle/suggest', aiLimiter, async (req: Request, res: Response) => {
   try {
-    const { imageData, objectLabel = 'Деревянный стул' } = req.body || {};
+    const validation = upcycleSuggestSchema.safeParse(req.body);
+    if (!validation.success) {
+      res.status(400).json({
+        error: validation.error.issues[0]?.message || 'Укажите название объекта',
+      });
+      return;
+    }
+
+    const { objectLabel, confidence } = validation.data;
+
+    if (aiClient) {
+      try {
+        const text = await generateContentWithFallback(
+          aiClient,
+          [
+            {
+              text: `Ты — эксперт по апсайклингу и редизайну. Объект: "${objectLabel}" (уверенность распознавания: ${Math.round(
+                confidence * 100
+              )}%).
+Предложи ровно 3 практичные идеи переделки или повторного использования этой вещи.
+Ответь строго валидным JSON:
+{
+  "suggestions": [
+    {
+      "title": "Короткое название",
+      "summary": "Что сделать и какой результат получится",
+      "estimatedBudgetRub": 700
+    }
+  ]
+}`,
+            },
+          ],
+          { responseMimeType: 'application/json' }
+        );
+        const parsed = parseCleanJson<{ suggestions?: unknown[] }>(text);
+        if (Array.isArray(parsed.suggestions) && parsed.suggestions.length > 0) {
+          res.json({
+            objectLabel,
+            suggestions: parsed.suggestions.slice(0, 3),
+            source: 'gemini',
+          });
+          return;
+        }
+      } catch (err) {
+        console.warn('Gemini upcycle/suggest fallback triggered:', err);
+      }
+    }
+
+    res.json({
+      objectLabel,
+      source: 'smart-engine',
+      suggestions: [
+        {
+          title: `Обновление корпуса (${objectLabel})`,
+          summary: 'Глубокая очистка, лёгкая шлифовка и окраска стойкой эмалью в современный матовый тон.',
+          estimatedBudgetRub: 750,
+        },
+        {
+          title: 'Повторное использование модулей',
+          summary: 'Разбор на исправные узлы, декор или детали для бытовых DIY-органайзеров.',
+          estimatedBudgetRub: 350,
+        },
+        {
+          title: 'Преобразование в интерьерный акцент',
+          summary: 'Добавление деревянной полки или LED-подсветки для создания функционального элемента.',
+          estimatedBudgetRub: 1100,
+        },
+      ],
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Server error' });
+  }
+});
+
+// API: Генерация 5 идей апсайклинга (/api/upcycle-ideas)
+app.post('/api/upcycle-ideas', aiLimiter, async (req: Request, res: Response) => {
+  try {
+    const validation = upcycleIdeasSchema.safeParse(req.body);
+    if (!validation.success) {
+      res.status(400).json({
+        error: validation.error.issues[0]?.message || 'Некорректные параметры запроса',
+      });
+      return;
+    }
+    const { imageData, objectLabel } = validation.data;
 
     if (aiClient) {
       try {
@@ -192,27 +242,26 @@ app.post('/api/upcycle-ideas', async (req: Request, res: Response) => {
           });
         }
 
-        const text = await callGeminiWithFallback(parts, { responseMimeType: 'application/json' });
-        const jsonMatch = text.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          const parsed = JSON.parse(jsonMatch[0]);
-          if (Array.isArray(parsed.ideas) && parsed.ideas.length > 0) {
-            const normalized = parsed.ideas.slice(0, 5).map((idea: any, i: number) => ({
-              id: `ai-idea-${Date.now()}-${i}`,
-              title: String(idea.title || `Идея ${i + 1}`),
-              description: String(idea.description || ''),
-              materials: Array.isArray(idea.materials) ? idea.materials.map(String) : [],
-              difficulty: ['easy', 'medium', 'hard'].includes(idea.difficulty)
-                ? idea.difficulty
-                : 'easy',
-              estimatedHours: Number(idea.estimatedHours) || 3,
-              materialsCost: Number(idea.materialsCost) || 850,
-              marketValueAfter: Number(idea.marketValueAfter) || 4500,
-              objectLabel,
-            }));
-            res.json({ ideas: normalized, source: 'gemini' });
-            return;
-          }
+        const text = await generateContentWithFallback(aiClient, parts, {
+          responseMimeType: 'application/json',
+        });
+        const parsed = parseCleanJson<{ ideas?: any[] }>(text);
+        if (Array.isArray(parsed.ideas) && parsed.ideas.length > 0) {
+          const normalized = parsed.ideas.slice(0, 5).map((idea: any, i: number) => ({
+            id: `ai-idea-${Date.now()}-${i}`,
+            title: String(idea.title || `Идея ${i + 1}`),
+            description: String(idea.description || ''),
+            materials: Array.isArray(idea.materials) ? idea.materials.map(String) : [],
+            difficulty: ['easy', 'medium', 'hard'].includes(idea.difficulty)
+              ? idea.difficulty
+              : 'easy',
+            estimatedHours: Number(idea.estimatedHours) || 3,
+            materialsCost: Number(idea.materialsCost) || 850,
+            marketValueAfter: Number(idea.marketValueAfter) || 4500,
+            objectLabel,
+          }));
+          res.json({ ideas: normalized, source: 'gemini' });
+          return;
         }
       } catch (err) {
         console.warn('Gemini upcycle-ideas fallback triggered:', err);
@@ -287,15 +336,23 @@ app.post('/api/upcycle-ideas', async (req: Request, res: Response) => {
 });
 
 // API: Распознавание продуктов в холодильнике и генерация 3+ рецептов (/api/recipes)
-app.post('/api/recipes', async (req: Request, res: Response) => {
+app.post('/api/recipes', aiLimiter, async (req: Request, res: Response) => {
   try {
-    const { imageData, ingredients = [] } = req.body || {};
+    const validation = recipesSchema.safeParse(req.body);
+    if (!validation.success) {
+      res.status(400).json({
+        error: validation.error.issues[0]?.message || 'Некорректные параметры запроса',
+      });
+      return;
+    }
+    const { imageData, ingredients } = validation.data;
 
     const parsedRecipeImg =
       typeof imageData === 'string' ? parseImageDataUrl(imageData) : null;
     if (aiClient && parsedRecipeImg) {
       try {
-        const text = await callGeminiWithFallback(
+        const text = await generateContentWithFallback(
+          aiClient,
           [
             {
               text: `Ты — шеф-повар Zero-Waste проекта "МастерОК". Распознай продукты на фото и предложи 3 простых вкусных рецепта из них.
@@ -326,17 +383,14 @@ app.post('/api/recipes', async (req: Request, res: Response) => {
           ],
           { responseMimeType: 'application/json' }
         );
-        const jsonMatch = text.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          const parsed = JSON.parse(jsonMatch[0]);
-          if (Array.isArray(parsed.detectedIngredients) && Array.isArray(parsed.recipes)) {
-            res.json({
-              detectedIngredients: parsed.detectedIngredients,
-              recipes: parsed.recipes,
-              source: 'gemini',
-            });
-            return;
-          }
+        const parsed = parseCleanJson<{ detectedIngredients?: unknown[]; recipes?: unknown[] }>(text);
+        if (Array.isArray(parsed.detectedIngredients) && Array.isArray(parsed.recipes)) {
+          res.json({
+            detectedIngredients: parsed.detectedIngredients,
+            recipes: parsed.recipes,
+            source: 'gemini',
+          });
+          return;
         }
       } catch (err) {
         console.warn('Gemini recipes fallback triggered:', err);
@@ -414,15 +468,19 @@ app.post('/api/recipes', async (req: Request, res: Response) => {
 });
 
 // API: Анализ изображения техники/мебели/холодильника и любых бытовых объектов
-app.post('/api/analyze-image', async (req: Request, res: Response) => {
+app.post('/api/analyze-image', aiLimiter, async (req: Request, res: Response) => {
   try {
-    const { image, mode = 'appliance' } = req.body || {};
-
-    if (!image || typeof image !== 'string') {
-      res.status(400).json({ success: false, error: 'Image data is required' });
+    const validation = analyzeImageSchema.safeParse(req.body);
+    if (!validation.success) {
+      res.status(400).json({
+        success: false,
+        source: 'invalid_format',
+        error: validation.error.issues[0]?.message || 'Некорректные данные изображения',
+      });
       return;
     }
 
+    const { image, mode } = validation.data;
     const parsedImage = parseImageDataUrl(image);
     if (!parsedImage) {
       res.status(400).json({
@@ -496,7 +554,8 @@ app.post('/api/analyze-image', async (req: Request, res: Response) => {
 }`;
 
     try {
-      const text = await callGeminiWithFallback(
+      const text = await generateContentWithFallback(
+        aiClient,
         [
           { text: prompt },
           { inlineData: { mimeType: parsedImage.mimeType, data: parsedImage.data } },
@@ -504,12 +563,7 @@ app.post('/api/analyze-image', async (req: Request, res: Response) => {
         { responseMimeType: 'application/json' }
       );
 
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        throw new Error('Gemini did not return valid JSON');
-      }
-
-      const parsed = JSON.parse(jsonMatch[0]);
+      const parsed = parseCleanJson<Record<string, any>>(text);
       const rawGuideId =
         typeof parsed.suggestedGuideId === 'string' ? parsed.suggestedGuideId : null;
       let safeGuideId = rawGuideId && VALID_GUIDE_IDS.has(rawGuideId) ? rawGuideId : null;
@@ -551,18 +605,20 @@ app.post('/api/analyze-image', async (req: Request, res: Response) => {
 });
 
 // API: Экспертный чат помощи (SOS)
-app.post('/api/expert-chat', async (req: Request, res: Response) => {
+app.post('/api/expert-chat', aiLimiter, async (req: Request, res: Response) => {
   try {
-    const { message, context } = req.body;
-
-    if (!message) {
-      res.status(400).json({ error: 'Message is required' });
+    const validation = expertChatSchema.safeParse(req.body);
+    if (!validation.success) {
+      res.status(400).json({
+        error: validation.error.issues[0]?.message || 'Введите вопрос для эксперта',
+      });
       return;
     }
+    const { message, context } = validation.data;
 
     if (aiClient) {
       try {
-        const replyText = await callGeminiWithFallback([
+        const replyText = await generateContentWithFallback(aiClient, [
           {
             text: `Ты — старший мастер сервисной поддержки "МастерОК" Алексей Смирнов.
 Контекст: ${JSON.stringify(context || {})}

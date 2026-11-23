@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Palette,
   Leaf,
@@ -23,12 +23,21 @@ export const UpcyclingLab: React.FC = () => {
   const navigate = useAppStore((s) => s.navigate);
   const savedIdeas = useAppStore((s) => s.savedIdeas);
   const toggleSaveIdea = useAppStore((s) => s.toggleSaveIdea);
+  const lastDetectedObject = useAppStore((s) => s.lastDetectedObject);
 
   const [activeProject] = useState<UpcyclingProject>(UPCYCLING_PROJECTS[0]);
   const [selectedColor, setSelectedColor] = useState<string>(activeProject.palette[0].hex);
-  const [objectInput, setObjectInput] = useState<string>('Старый деревянный стул');
+  const [objectInput, setObjectInput] = useState<string>(
+    lastDetectedObject?.label || 'Старый деревянный стул'
+  );
   const [generatedIdeas, setGeneratedIdeas] = useState<GeneratedUpcycleIdea[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
+
+  useEffect(() => {
+    if (lastDetectedObject?.label) {
+      setObjectInput(lastDetectedObject.label);
+    }
+  }, [lastDetectedObject]);
 
   const valuation = estimateUpcyclingValue(1000, activeProject.budgetRub, 'upholstery');
 
@@ -134,6 +143,12 @@ export const UpcyclingLab: React.FC = () => {
         <p className="text-sm sm:text-base text-slate-300 max-w-2xl leading-relaxed">
           Укажите предмет или отсканируйте вещь камерой — ИИ подберёт 5 идей реновации со списком материалов, оценкой стоимости и AR-помощником.
         </p>
+
+        {lastDetectedObject && (
+          <div className="text-xs text-amber-300">
+            Подставлен объект со сканера: <span className="font-semibold text-white">{lastDetectedObject.label}</span>
+          </div>
+        )}
 
         {/* AI 5-Ideas Generator Form */}
         <form
